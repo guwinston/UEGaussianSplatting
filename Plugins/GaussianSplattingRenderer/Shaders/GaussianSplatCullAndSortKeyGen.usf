@@ -1,0 +1,336 @@
+// GaussianSplatDepthSort.usf
+// GPU cull + depth-key build passes for merged Gaussian splat rendering.
+
+#include "/Engine/Public/Platform.ush"
+
+static const uint GS_CHUNK_SIZE = 256u;
+
+StructuredBuffer<uint4> PerObjectBuffer;
+Buffer<uint> GlobalPackedPositionBuffer;
+StructuredBuffer<uint> GlobalPackedColorBuffer;
+StructuredBuffer<float4> GlobalChunkPositionMinBuffer;
+StructuredBuffer<float4> GlobalChunkPositionMaxBuffer;
+Buffer<uint> GlobalObjectIndexBuffer;
+Buffer<uint> ObjectVisibilityBuffer;
+Buffer<uint> VisibleCountBuffer;
+
+RWBuffer<uint> OutObjectVisibility;
+RWBuffer<uint> OutDepthKeys;
+RWBuffer<uint> OutVisibleCount;
+RWBuffer<uint> OutDrawIndirectArgs;
+
+int ObjectCount;
+int TotalSplatCount;
+uint SplatDispatchOffset;
+int CullMode;
+float TanHalfFovX;
+float TanHalfFovY;
+float FrustumSlack;
+float4x4 WorldToView;
+float4x4 ViewToClip;
+
+struct FObjectDesc
+{
+    float4x4 LocalToWorld;
+    float4x4 WorldToLocal;
+    uint SplatOffset;
+    uint SplatCount;
+    uint ChunkOffset;
+    uint SHDataOffset;
+    uint MaxSHDegree;
+    uint SHDegree;
+    uint SHCoefficientsPerChannel;
+    uint SHPackedWordsPerSplat;
+    float SplatScale;
+    float AlphaCullThreshold;
+    float _Pad0;
+    float ColorQuantMinX;
+    float3 LocalBoundsMin;
+    float ColorQuantMinY;
+    float3 LocalBoundsMax;
+    float ColorQuantMinZ;
+    float4 _Pad1;
+    float3 ColorQuantMax;
+    uint ScaleCodebookOffset;
+    uint SHCodebookOffset;
+    uint _Pad6;
+    uint _Pad7;
+    uint _Pad8;
+};
+
+FObjectDesc LoadObjectDesc(uint objectIndex)
+{
+    uint base = objectIndex * 16u;
+
+    FObjectDesc d;
+    d.LocalToWorld[0] = asfloat(PerObjectBuffer[base + 0]);
+    d.LocalToWorld[1] = asfloat(PerObjectBuffer[base + 1]);
+    d.LocalToWorld[2] = asfloat(PerObjectBuffer[base + 2]);
+    d.LocalToWorld[3] = asfloat(PerObjectBuffer[base + 3]);
+
+    d.WorldToLocal[0] = asfloat(PerObjectBuffer[base + 4]);
+    d.WorldToLocal[1] = asfloat(PerObjectBuffer[base + 5]);
+    d.WorldToLocal[2] = asfloat(PerObjectBuffer[base + 6]);
+    d.WorldToLocal[3] = asfloat(PerObjectBuffer[base + 7]);
+
+    uint4 u8 = PerObjectBuffer[base + 8];
+    d.SplatOffset = u8.x;
+    d.SplatCount = u8.y;
+    d.ChunkOffset = u8.z;
+    d.SHDataOffset = u8.w;
+
+    uint4 u9 = PerObjectBuffer[base + 9];
+    d.MaxSHDegree = u9.x;
+    d.SHDegree = u9.y;
+    d.SHCoefficientsPerChannel = u9.z;
+    d.SHPackedWordsPerSplat = u9.w;
+
+    float4 u10 = asfloat(PerObjectBuffer[base + 10]);
+    d.SplatScale = u10.x;
+    d.AlphaCullThreshold = u10.y;
+    d._Pad0 = u10.z;
+    d.ColorQuantMinX = u10.w;
+
+    d.LocalBoundsMin = asfloat(PerObjectBuffer[base + 11]).xyz;
+    d.ColorQuantMinY = asfloat(PerObjectBuffer[base + 11].w);
+    d.LocalBoundsMax = asfloat(PerObjectBuffer[base + 12]).xyz;
+    d.ColorQuantMinZ = asfloat(PerObjectBuffer[base + 12].w);
+
+    d._Pad1 = asfloat(PerObjectBuffer[base + 13]);
+
+    float4 u14 = asfloat(PerObjectBuffer[base + 14]);
+    d.ColorQuantMax = u14.xyz;
+    uint4 u14i = PerObjectBuffer[base + 14];
+    d.ScaleCodebookOffset = u14i.w;
+
+    uint4 u15i = PerObjectBuffer[base + 15];
+    d.SHCodebookOffset = u15i.x;
+    d._Pad6 = u15i.y;
+    d._Pad7 = u15i.z;
+    d._Pad8 = u15i.w;
+
+    return d;
+}
+
+float3 DecodePackedPosition(uint globalSplatIndex, float3 positionMin, float3 positionMax)
+{
+    float3 normalized = float3(
+        GlobalPackedPositionBuffer[globalSplatIndex * 3u + 0u] / 65535.0f,
+        GlobalPackedPositionBuffer[globalSplatIndex * 3u + 1u] / 65535.0f,
+        GlobalPackedPositionBuffer[globalSplatIndex * 3u + 2u] / 65535.0f);
+    return lerp(positionMin, positionMax, normalized);
+}
+
+float DecodePackedAlpha(uint packedColor)
+{
+    return ((packedColor >> 24u) & 0xffu) / 255.0f;
+}
+
+float3 DecodeGlobalSplatPosition(FObjectDesc obj, uint globalSplatIndex)
+{
+    uint localSplatIndex = globalSplatIndex - obj.SplatOffset;
+    uint chunkIndex = obj.ChunkOffset + (localSplatIndex / GS_CHUNK_SIZE);
+    float3 positionMin = GlobalChunkPositionMinBuffer[chunkIndex].xyz;
+    float3 positionMax = GlobalChunkPositionMaxBuffer[chunkIndex].xyz;
+    return DecodePackedPosition(globalSplatIndex, positionMin, positionMax);
+}
+
+uint FloatToSortableUint(float value)
+{
+    // GPU radix sort here operates on uint keys, not float keys.
+    // Reinterpreting a float bit-pattern as uint is not enough, because IEEE754
+    // float bit order does not match numeric order across negative/positive values:
+    //   - positive floats already increase with their uint bit pattern
+    //   - negative floats are reversed in uint space because the sign bit is set
+    //
+    // This remap converts the float into a uint whose lexicographic uint order
+    // matches the original float numeric order:
+    //   - for positive values: flip the sign bit, moving them above negatives
+    //   - for negative values: invert all bits, reversing their ordering so that
+    //     "more negative" values become smaller sortable uints
+    //
+    // The result is a monotonic sortable key suitable for radix sort.
+    uint bits = asuint(value);
+    return bits ^ ((-(int)(bits >> 31)) | 0x80000000u);
+}
+
+// ------------------------------------------------------------
+// CullObjectsCS
+//
+// One thread handles one Gaussian object.
+// The shader performs a conservative object-level frustum test against the
+// object's local AABB and writes a single visibility bit:
+//   1 -> object may be visible
+//   0 -> object is definitely outside the frustum
+//
+// This is only a coarse early-out. Even if the object survives here, later
+// passes still perform per-splat visibility checks.
+// ------------------------------------------------------------
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void CullObjectsCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    uint objectIndex = ThreadId.x;
+    if (objectIndex >= (uint)ObjectCount)
+    {
+        return;
+    }
+
+    if (CullMode < 1)
+    {
+        // CullMode 0 disables object culling completely, so every object is
+        // treated as potentially visible and forwarded to the per-splat pass.
+        OutObjectVisibility[objectIndex] = 1u;
+        return;
+    }
+
+    FObjectDesc obj = LoadObjectDesc(objectIndex);
+    // Build a single Local -> Clip transform so the eight AABB corners can be
+    // tested directly against clip-space frustum planes.
+    float4x4 localToClip = mul(mul(obj.LocalToWorld, WorldToView), ViewToClip);
+
+    float3 mn = obj.LocalBoundsMin;
+    float3 mx = obj.LocalBoundsMax;
+    float3 corners[8] = {
+        float3(mn.x, mn.y, mn.z), float3(mx.x, mn.y, mn.z),
+        float3(mn.x, mx.y, mn.z), float3(mx.x, mx.y, mn.z),
+        float3(mn.x, mn.y, mx.z), float3(mx.x, mn.y, mx.z),
+        float3(mn.x, mx.y, mx.z), float3(mx.x, mx.y, mx.z)
+    };
+
+    uint outsideLeftCount = 0u;
+    uint outsideRightCount = 0u;
+    uint outsideBottomCount = 0u;
+    uint outsideTopCount = 0u;
+    uint outsideNearCount = 0u;
+    uint outsideFarCount = 0u;
+
+    [unroll]
+    for (uint i = 0u; i < 8u; ++i)
+    {
+        float4 clipPos = mul(float4(corners[i], 1.0f), localToClip);
+        // Standard homogeneous clip-space frustum test:
+        //   -w <= x <= w
+        //   -w <= y <= w
+        //    0 <= z <= w
+        // Count how many corners lie completely outside each plane. If all
+        // eight corners fall outside the same plane, the whole box is culled.
+        outsideLeftCount += (clipPos.x < -clipPos.w) ? 1u : 0u;
+        outsideRightCount += (clipPos.x > clipPos.w) ? 1u : 0u;
+        outsideBottomCount += (clipPos.y < -clipPos.w) ? 1u : 0u;
+        outsideTopCount += (clipPos.y > clipPos.w) ? 1u : 0u;
+        outsideNearCount += (clipPos.z < 0.0f) ? 1u : 0u;
+        outsideFarCount += (clipPos.z > clipPos.w) ? 1u : 0u;
+    }
+
+    const bool bOutsideFrustum =
+        outsideLeftCount == 8u ||
+        outsideRightCount == 8u ||
+        outsideBottomCount == 8u ||
+        outsideTopCount == 8u ||
+        outsideNearCount == 8u ||
+        outsideFarCount == 8u;
+
+    OutObjectVisibility[objectIndex] = bOutsideFrustum ? 0u : 1u;
+}
+
+// ------------------------------------------------------------
+// BuildSortKeysCS
+//
+// One thread handles one splat from the merged global splat stream.
+// This pass performs:
+//   1. coarse object-visibility rejection
+//   2. per-splat alpha/depth/frustum rejection
+//   3. depth-key generation for surviving splats
+//   4. visible-splat counting for indirect draw
+//
+// The output key buffer is full-sized over the entire global splat stream.
+// Culled splats are not compacted out here; instead they receive a maximal
+// key so they sort to the tail, while VisibleCount determines how large the
+// final draw prefix is.
+// ------------------------------------------------------------
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void BuildSortKeysCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    uint globalSplatIndex = SplatDispatchOffset + ThreadId.x;
+    if (globalSplatIndex >= (uint)TotalSplatCount)
+    {
+        return;
+    }
+
+    uint objectIndex = GlobalObjectIndexBuffer[globalSplatIndex];
+    FObjectDesc obj = LoadObjectDesc(objectIndex);
+
+    bool bVisible = true;
+    if (CullMode >= 1 && ObjectVisibilityBuffer[objectIndex] == 0u)
+    {
+        // Entire object already failed the coarse object-level frustum test.
+        bVisible = false;
+    }
+
+    float alpha = DecodePackedAlpha(GlobalPackedColorBuffer[globalSplatIndex]);
+    if (alpha < obj.AlphaCullThreshold)
+    {
+        // Very low-opacity splats are skipped before sorting to reduce both
+        // overdraw and useless participation in the global depth ordering.
+        bVisible = false;
+    }
+
+    float3 splatPos = DecodeGlobalSplatPosition(obj, globalSplatIndex);
+    float4x4 localToView = mul(obj.LocalToWorld, WorldToView);
+    float4 viewPos = mul(float4(splatPos, 1.0f), localToView);
+
+    if (viewPos.z <= 0.0f)
+    {
+        // The current renderer assumes positive forward view-space depth.
+        // Splats behind the camera are rejected before key generation.
+        bVisible = false;
+    }
+
+    if (bVisible && CullMode >= 2)
+    {
+        // Fine per-splat XY frustum test in view space.
+        // TanHalfFovX/Y define the side planes of the current perspective
+        // frustum; FrustumSlack expands them slightly to reduce accidental
+        // clipping near the viewport boundary.
+        float slackTanX = TanHalfFovX * max(FrustumSlack, 1.0f);
+        float slackTanY = TanHalfFovY * max(FrustumSlack, 1.0f);
+        if (abs(viewPos.x) > viewPos.z * slackTanX || abs(viewPos.y) > viewPos.z * slackTanY)
+        {
+            bVisible = false;
+        }
+    }
+
+    if (bVisible)
+    {
+        uint previousVisibleCount;
+        // Count visible splats on the GPU so the later indirect draw can render
+        // only the visible prefix of the sorted index stream.
+        InterlockedAdd(OutVisibleCount[0], 1u, previousVisibleCount);
+        // Back-to-front blending needs farther splats first. Using -viewPos.z
+        // converts larger depth (farther away) into smaller sortable values.
+        OutDepthKeys[globalSplatIndex] = FloatToSortableUint(-viewPos.z);
+    }
+    else
+    {
+        // Culled splats are pushed to the end of the sorted stream instead of
+        // being compacted out in this pass.
+        OutDepthKeys[globalSplatIndex] = 0xFFFFFFFFu;
+    }
+}
+
+// ------------------------------------------------------------
+// BuildIndirectArgsCS
+//
+// Converts the GPU-side visible splat count into a non-indexed draw-indirect
+// argument buffer. Each splat is rendered as one quad made of two triangles,
+// so each visible splat contributes 6 vertices.
+// ------------------------------------------------------------
+[numthreads(1, 1, 1)]
+void BuildIndirectArgsCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    uint visibleCount = VisibleCountBuffer[0];
+    OutDrawIndirectArgs[0] = visibleCount * 6u;
+    OutDrawIndirectArgs[1] = 1u;
+    OutDrawIndirectArgs[2] = 0u;
+    OutDrawIndirectArgs[3] = 0u;
+}

@@ -1,0 +1,664 @@
+// GaussianSplat.usf
+// Vertex + Pixel shaders for 3D Gaussian Splatting rendering
+//
+// Algorithm overview (single-pass merged rendering):
+//   All active GaussianSplat proxies are rendered in a SINGLE draw call.
+//   The VS first reads SortedVisibleIndexBuffer to get the global splat order,
+//   then resolves the owning object through GlobalObjectIndexBuffer.
+//   It then looks up the per-object transform and buffer offsets from
+//   PerObjectBuffer and fetches splat data from the merged global buffers.
+//
+//   This solves the inter-object overlap artefact: all splats across all objects
+//   are globally sorted back-to-front before rendering, so overlapping Gaussian
+//   scenes composite correctly regardless of spatial complexity.
+//
+// References:
+//   - Original 3DGS (INRIA): cuda_rasterizer/forward.cu
+//   - VK implementation: shaders/threedgs_raster.*.slang
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/GaussianSplattingRenderer/GaussianSplatCommon.ush"
+
+#ifndef RASTER_MODE
+#define RASTER_MODE 1
+#endif
+
+// ============================================================
+// Per-Object GPU Descriptor
+// Must match FGaussianSplatObjectGPUDesc in GaussianSplatShaders.h
+//
+// Layout (in HLSL uint4 packing: 16 bytes per uint4):
+//   Two 4x4 matrices + scalar fields.
+//   We read this as a StructuredBuffer<uint4> for maximum portability and
+//   decode the fields manually.
+//
+// Memory layout of FGaussianSplatObjectGPUDesc:
+//   [0]  LocalToWorld row 0   (4 floats)
+//   [1]  LocalToWorld row 1   (4 floats)
+//   [2]  LocalToWorld row 2   (4 floats)
+//   [3]  LocalToWorld row 3   (4 floats)
+//   [4]  WorldToLocal row 0   (4 floats)
+//   [5]  WorldToLocal row 1   (4 floats)
+//   [6]  WorldToLocal row 2   (4 floats)
+//   [7]  WorldToLocal row 3   (4 floats)
+//   [8]  SplatOffset, SplatCount, ChunkOffset, SHDataOffset
+//   [9]  MaxSHDegree, SHDegree, SHCoefficientsPerChannel, SHPackedWordsPerSplat
+//   [10] SplatScale, AlphaCullThreshold, padding, ColorQuantMinX
+//   [11] LocalBoundsMin.xyz, ColorQuantMinY
+//   [12] LocalBoundsMax.xyz, ColorQuantMinZ
+//   [13] padding
+//   [14] ColorQuantMax.xyz, unused
+//   [15] SHCodebookOffset, padding, padding, padding
+//
+// Total: 16 uint4 = 256 bytes per object.
+// ============================================================
+
+struct FObjectDesc
+{
+    float4x4 LocalToWorld;
+    float4x4 WorldToLocal;
+    uint  SplatOffset;
+    uint  SplatCount;
+    uint  ChunkOffset;
+    uint  SHDataOffset;
+    uint  MaxSHDegree;
+    uint  SHDegree;
+    uint  SHCoefficientsPerChannel;
+    uint  SHPackedWordsPerSplat;
+    float SplatScale;
+    float AlphaCullThreshold;
+    float _Pad0;
+    float ColorQuantMinX;
+    float3 LocalBoundsMin;
+    float ColorQuantMinY;
+    float3 LocalBoundsMax;
+    float ColorQuantMinZ;
+    float4 _Pad1;
+    float3 ColorQuantMax;
+    uint  ScaleCodebookOffset;
+    uint  SHCodebookOffset;
+    uint  _Pad6;
+    uint  _Pad7;
+    uint  _Pad8;
+};
+
+// ============================================================
+// GPU Buffers
+// ============================================================
+
+// Per-object descriptor array: one entry per active Gaussian proxy.
+// Encoded as raw uint4 for portable reading; decoded via LoadObjectDesc().
+StructuredBuffer<uint4>  PerObjectBuffer;
+
+// Merged global splat data buffers (all proxies concatenated).
+Buffer<uint>             GlobalPackedPositionBuffer;
+StructuredBuffer<uint>   GlobalPackedColorBuffer;
+StructuredBuffer<uint>   GlobalPackedRotationBuffer;
+StructuredBuffer<uint>   GlobalPackedScaleBuffer;
+StructuredBuffer<uint>   GlobalPackedSHDataBuffer;
+StructuredBuffer<float>  GlobalSHCodebookBuffer;
+StructuredBuffer<float4> GlobalChunkPositionMinBuffer;
+StructuredBuffer<float4> GlobalChunkPositionMaxBuffer;
+Buffer<uint>             GlobalObjectIndexBuffer; // N_total uints: global splat index -> object index
+
+// Draw-order buffer over the global splat list.
+Buffer<uint> SortedVisibleIndexBuffer;
+
+// Camera / viewport (shared for all objects in this pass)
+float4x4  WorldToView;
+float4x4  ViewToClip;
+float3    CameraPosition;
+float2    FocalLength;      // (fx, fy) in pixels
+float2    ViewportMin;      // (minX, minY) in pixels
+float2    ViewportSize;     // (width, height) in pixels
+Texture2D SceneDepthTexture;
+SamplerState SceneDepthSampler;
+float2    SceneDepthViewportMin;
+float2    SceneDepthViewportSize;
+float2    SceneDepthTextureExtentInverse;
+uint      UseManualSceneDepthTest;
+int       TotalSplatCount;  // total splats across all objects
+int       ObjectCount;
+uint      EnableAntialiasing;
+float     PreExposure;      // View.PreExposure: multiplier to match SceneColor HDR range
+static const uint GS_CHUNK_SIZE = 256u;
+// ============================================================
+// Object descriptor loader
+// Reads one FObjectDesc from PerObjectBuffer[objectIndex].
+// Each FObjectDesc occupies 15 consecutive uint4 entries.
+// ============================================================
+FObjectDesc LoadObjectDesc(uint objectIndex)
+{
+    uint base = objectIndex * 16u;
+
+    FObjectDesc d;
+
+    // LocalToWorld: rows 0-3
+    d.LocalToWorld[0] = asfloat(PerObjectBuffer[base + 0]);
+    d.LocalToWorld[1] = asfloat(PerObjectBuffer[base + 1]);
+    d.LocalToWorld[2] = asfloat(PerObjectBuffer[base + 2]);
+    d.LocalToWorld[3] = asfloat(PerObjectBuffer[base + 3]);
+
+    // WorldToLocal: rows 4-7
+    d.WorldToLocal[0] = asfloat(PerObjectBuffer[base + 4]);
+    d.WorldToLocal[1] = asfloat(PerObjectBuffer[base + 5]);
+    d.WorldToLocal[2] = asfloat(PerObjectBuffer[base + 6]);
+    d.WorldToLocal[3] = asfloat(PerObjectBuffer[base + 7]);
+
+    uint4 u8 = PerObjectBuffer[base + 8];
+    d.SplatOffset = u8.x;
+    d.SplatCount = u8.y;
+    d.ChunkOffset = u8.z;
+    d.SHDataOffset = u8.w;
+
+    uint4 u9 = PerObjectBuffer[base + 9];
+    d.MaxSHDegree = u9.x;
+    d.SHDegree = u9.y;
+    d.SHCoefficientsPerChannel = u9.z;
+    d.SHPackedWordsPerSplat = u9.w;
+
+    float4 u10 = asfloat(PerObjectBuffer[base + 10]);
+    d.SplatScale = u10.x;
+    d.AlphaCullThreshold = u10.y;
+    d._Pad0 = u10.z;
+    d.ColorQuantMinX = u10.w;
+
+    d.LocalBoundsMin = asfloat(PerObjectBuffer[base + 11]).xyz;
+    d.ColorQuantMinY = asfloat(PerObjectBuffer[base + 11].w);
+    d.LocalBoundsMax = asfloat(PerObjectBuffer[base + 12]).xyz;
+    d.ColorQuantMinZ = asfloat(PerObjectBuffer[base + 12].w);
+    d._Pad1 = asfloat(PerObjectBuffer[base + 13]);
+
+    float4 u14 = asfloat(PerObjectBuffer[base + 14]);
+    d.ColorQuantMax = u14.xyz;
+    uint4 u14i = PerObjectBuffer[base + 14];
+    d.ScaleCodebookOffset = u14i.w;
+
+    uint4 u15i = PerObjectBuffer[base + 15];
+    d.SHCodebookOffset = u15i.x;
+    d._Pad6 = u15i.y;
+    d._Pad7 = u15i.z;
+    d._Pad8 = u15i.w;
+
+    return d;
+}
+
+float3 DecodePackedPosition(uint globalSplatIndex, float3 positionMin, float3 positionMax)
+{
+    float3 normalized = float3(
+        GlobalPackedPositionBuffer[globalSplatIndex * 3u + 0u] / 65535.0f,
+        GlobalPackedPositionBuffer[globalSplatIndex * 3u + 1u] / 65535.0f,
+        GlobalPackedPositionBuffer[globalSplatIndex * 3u + 2u] / 65535.0f);
+    return lerp(positionMin, positionMax, normalized);
+}
+
+float3 DecodePackedFixedLogScale(uint packedScale)
+{
+    uint scaleX = packedScale & 0xffu;
+    uint scaleY = (packedScale >> 8u) & 0xffu;
+    uint scaleZ = (packedScale >> 16u) & 0xffu;
+
+    // Fixed SPZ-style log-scale decode, shifted from source meters to UE
+    // centimeters by +ln(100). Each byte represents one step of 1/16 in log
+    // space, so the decoded linear scale is stable and independent of the
+    // current asset's scale distribution.
+    static const float FixedLogScaleMin = -10.0f + 4.605170185988091368f;
+    static const float FixedLogScaleStep = 1.0f / 16.0f;
+    return FixedLogScaleMin + float3(scaleX, scaleY, scaleZ) * FixedLogScaleStep;
+}
+
+float4 DecodePackedQuaternion(uint packedRotation)
+{
+    uint largestComponentIndex = packedRotation >> 30u;
+    float3 reduced = float3(
+        (float)((packedRotation >> 20u) & 0x3ffu),
+        (float)((packedRotation >> 10u) & 0x3ffu),
+        (float)(packedRotation & 0x3ffu));
+    reduced = ((reduced / 1023.0f) - 0.5f) * (2.0f * sqrt(2.0f));
+
+    float missing = sqrt(saturate(1.0f - dot(reduced, reduced)));
+    float4 quaternion;
+    if (largestComponentIndex == 0u)
+    {
+        quaternion = float4(missing, reduced.x, reduced.y, reduced.z);
+    }
+    else if (largestComponentIndex == 1u)
+    {
+        quaternion = float4(reduced.x, missing, reduced.y, reduced.z);
+    }
+    else if (largestComponentIndex == 2u)
+    {
+        quaternion = float4(reduced.x, reduced.y, missing, reduced.z);
+    }
+    else
+    {
+        quaternion = float4(reduced.x, reduced.y, reduced.z, missing);
+    }
+    return normalize(quaternion);
+}
+
+float3x3 BuildRotationMatrixFromQuaternion(float4 packedQuaternionXYZW)
+{
+    float qx = packedQuaternionXYZW.x;
+    float qy = packedQuaternionXYZW.y;
+    float qz = packedQuaternionXYZW.z;
+    float qw = packedQuaternionXYZW.w;
+
+    return float3x3(
+        1.0f - 2.0f * (qy*qy + qz*qz),  2.0f * (qx*qy - qw*qz),          2.0f * (qx*qz + qw*qy),
+        2.0f * (qx*qy + qw*qz),          1.0f - 2.0f * (qx*qx + qz*qz),  2.0f * (qy*qz - qw*qx),
+        2.0f * (qx*qz - qw*qy),          2.0f * (qy*qz + qw*qx),          1.0f - 2.0f * (qx*qx + qy*qy));
+}
+
+float3x3 BuildCovariance3D(float4 packedQuaternionXYZW, float3 scaleUE)
+{
+    float3x3 R = BuildRotationMatrixFromQuaternion(packedQuaternionXYZW);
+    float sx2 = scaleUE.x * scaleUE.x;
+    float sy2 = scaleUE.y * scaleUE.y;
+    float sz2 = scaleUE.z * scaleUE.z;
+
+    float Sxx = R[0][0]*sx2*R[0][0] + R[0][1]*sy2*R[0][1] + R[0][2]*sz2*R[0][2];
+    float Sxy = R[0][0]*sx2*R[1][0] + R[0][1]*sy2*R[1][1] + R[0][2]*sz2*R[1][2];
+    float Sxz = R[0][0]*sx2*R[2][0] + R[0][1]*sy2*R[2][1] + R[0][2]*sz2*R[2][2];
+    float Syy = R[1][0]*sx2*R[1][0] + R[1][1]*sy2*R[1][1] + R[1][2]*sz2*R[1][2];
+    float Syz = R[1][0]*sx2*R[2][0] + R[1][1]*sy2*R[2][1] + R[1][2]*sz2*R[2][2];
+    float Szz = R[2][0]*sx2*R[2][0] + R[2][1]*sy2*R[2][1] + R[2][2]*sz2*R[2][2];
+
+    return float3x3(
+        Sxx, Sxy, Sxz,
+        Sxy, Syy, Syz,
+        Sxz, Syz, Szz);
+}
+
+float3 OctDecode(float2 e)
+{
+    float3 n = float3(e.x, e.y, 1.0f - abs(e.x) - abs(e.y));
+    if (n.z < 0.0f)
+    {
+        float2 signXY = step(0.0f.xx, n.xy) * 2.0f - 1.0f;
+        n.xy = (1.0f - abs(n.yx)) * signXY;
+    }
+    return normalize(n);
+}
+
+float4 DecodePackedColor(FObjectDesc obj, uint packedColor)
+{
+    float3 colorMin = float3(obj.ColorQuantMinX, obj.ColorQuantMinY, obj.ColorQuantMinZ);
+    float3 colorMax = obj.ColorQuantMax;
+    float3 normalized = float3(
+        (packedColor & 0xffu) / 255.0f,
+        ((packedColor >> 8u) & 0xffu) / 255.0f,
+        ((packedColor >> 16u) & 0xffu) / 255.0f);
+    return float4(
+        lerp(colorMin, colorMax, normalized),
+        ((packedColor >> 24u) & 0xffu) / 255.0f);
+}
+
+uint GetChunkIndex(FObjectDesc obj, uint localSplatIndex)
+{
+    return obj.ChunkOffset + (localSplatIndex / GS_CHUNK_SIZE);
+}
+
+float3 DecodeGlobalSplatPosition(FObjectDesc obj, uint globalSplatIndex, uint localSplatIndex)
+{
+    uint chunkIndex = GetChunkIndex(obj, localSplatIndex);
+    return DecodePackedPosition(
+        globalSplatIndex,
+        GlobalChunkPositionMinBuffer[chunkIndex].xyz,
+        GlobalChunkPositionMaxBuffer[chunkIndex].xyz);
+}
+
+float3 DecodeGlobalSplatScale(FObjectDesc obj, uint globalSplatIndex, uint localSplatIndex)
+{
+    float3 logScale = DecodePackedFixedLogScale(GlobalPackedScaleBuffer[globalSplatIndex]);
+    return exp(logScale);
+}
+
+float DecodePackedSHByte(FObjectDesc obj, uint shWordIndex, uint byteIndexWithinWord)
+{
+    uint packedWord = GlobalPackedSHDataBuffer[shWordIndex];
+    uint codebookIndex = (packedWord >> (byteIndexWithinWord * 8u)) & 0xffu;
+    return GlobalSHCodebookBuffer[obj.SHCodebookOffset + codebookIndex];
+}
+
+void FetchSHGlobal(uint globalSplatIdx, FObjectDesc obj, int degree,
+                   out float3 shDeg1[3], out float3 shDeg2[5], out float3 shDeg3[7])
+{
+    [unroll] for (int i = 0; i < 3; ++i) shDeg1[i] = float3(0.0f, 0.0f, 0.0f);
+    [unroll] for (int i = 0; i < 5; ++i) shDeg2[i] = float3(0.0f, 0.0f, 0.0f);
+    [unroll] for (int i = 0; i < 7; ++i) shDeg3[i] = float3(0.0f, 0.0f, 0.0f);
+
+    uint shPackedWordsPerSplat = obj.SHPackedWordsPerSplat;
+
+    if (degree <= 0 || shPackedWordsPerSplat == 0u || obj.SHCoefficientsPerChannel == 0u)
+    {
+        return;
+    }
+
+    uint localSplatIdx = globalSplatIdx - obj.SplatOffset;
+    uint shWordBase = obj.SHDataOffset + localSplatIdx * shPackedWordsPerSplat;
+
+    const uint coeffCount = obj.SHCoefficientsPerChannel;
+    [loop]
+    for (uint coeffIndex = 0u; coeffIndex < coeffCount; ++coeffIndex)
+    {
+        uint byteBase = coeffIndex * 3u;
+        uint wordIndexR = shWordBase + (byteBase / 4u);
+        uint shiftR = byteBase & 3u;
+        uint wordIndexG = shWordBase + ((byteBase + 1u) / 4u);
+        uint shiftG = (byteBase + 1u) & 3u;
+        uint wordIndexB = shWordBase + ((byteBase + 2u) / 4u);
+        uint shiftB = (byteBase + 2u) & 3u;
+
+        float3 coeff = float3(
+            DecodePackedSHByte(obj, wordIndexR, shiftR),
+            DecodePackedSHByte(obj, wordIndexG, shiftG),
+            DecodePackedSHByte(obj, wordIndexB, shiftB));
+
+        if (coeffIndex < 3u)
+        {
+            shDeg1[coeffIndex] = coeff;
+        }
+        else if (coeffIndex < 8u)
+        {
+            shDeg2[coeffIndex - 3u] = coeff;
+        }
+        else
+        {
+            shDeg3[coeffIndex - 8u] = coeff;
+        }
+    }
+}
+
+// ============================================================
+// Color space helper
+// ============================================================
+float3 SRGBToLinear(float3 srgb)
+{
+    float3 useLinearSegment = step(srgb, float3(0.04045f, 0.04045f, 0.04045f));
+    float3 linearSegment = srgb / 12.92f;
+    float3 gammaSegment = pow((srgb + 0.055f) / 1.055f, 2.4f);
+    return lerp(gammaSegment, linearSegment, useLinearSegment);
+}
+
+// ============================================================
+// Discards the current pixel when the splat lies behind the scene depth.
+// clip(x) drops the pixel when x < 0, so the sign is flipped to match both
+// regular and inverted-Z depth conventions.
+// ============================================================
+void ClipOccludedPixel(float PixelZ, float SceneZ)
+{
+#if HAS_INVERTED_Z_BUFFER
+    float ClipDepth = PixelZ - SceneZ;
+#else
+    float ClipDepth = SceneZ - PixelZ;
+#endif
+    clip(ClipDepth);
+}
+
+// ============================================================
+// VS/PS interface
+// ============================================================
+struct FVSOutput
+{
+    float4 Position      : SV_Position;
+    nointerpolation float4 SplatColor   : COLOR0;      // RGB in asset color space + sigmoid opacity
+    float2 FragPos       : TEXCOORD0;   // Local parameter coords in [-sqrt8, +sqrt8]
+    nointerpolation float2 ScreenCenter : TEXCOORD1;   // Splat center in pixel coords (viewport-relative)
+    nointerpolation float3 Conic        : TEXCOORD2;   // Inverse 2D covariance: (xx, xy, yy)
+    nointerpolation float3 CenterViewPos : TEXCOORD3;         // Gaussian center position in view space, shared across the whole billboard quad.
+};
+
+FVSOutput MakeInvalidOutput()
+{
+    FVSOutput Out;
+    Out.Position = float4(0, 0, 2, 1);
+    Out.SplatColor = float4(0, 0, 0, 0);
+    Out.FragPos = float2(0, 0);
+    Out.ScreenCenter = float2(0, 0);
+    Out.Conic = float3(0, 0, 0);
+    Out.CenterViewPos = float3(0, 0, 0);
+    return Out;
+}
+
+// Quad corners in the Gaussian's local parameter space: a square over [-1, 1]^2
+// is rasterized first, then the pixel shader keeps only the inscribed sqrt(8)-radius circle.
+static const float2 QUAD_CORNERS[6] = {
+    float2(-1,-1), float2(1,-1), float2(1,1),
+    float2(-1,-1), float2(1, 1), float2(-1,1)
+};
+
+// ============================================================
+// VERTEX SHADER
+// ============================================================
+FVSOutput GaussianSplatVS(uint VertexID : SV_VertexID)
+{
+    FVSOutput Out = MakeInvalidOutput();
+
+    // ---- Decode sorted global splat index ----
+    uint globalIdx = SortedVisibleIndexBuffer[VertexID / 6];
+    if (globalIdx >= (uint)TotalSplatCount)
+    {
+        return Out;
+    }
+
+    uint objectIndex = GlobalObjectIndexBuffer[globalIdx];
+    uint cornerIdx   = VertexID % 6;
+
+    if (objectIndex >= (uint)ObjectCount)
+    {
+        return Out;
+    }
+
+    // ---- Load per-object descriptor ----
+    FObjectDesc obj = LoadObjectDesc(objectIndex);
+
+    // ---- Global buffer index ----
+    uint splatIdx = globalIdx - obj.SplatOffset;
+
+    float3 splatPos = DecodeGlobalSplatPosition(obj, globalIdx, splatIdx);
+    float4 splatColor = DecodePackedColor(obj, GlobalPackedColorBuffer[globalIdx]);
+
+    // Early alpha cull (per-object threshold)
+    if (splatColor.a < obj.AlphaCullThreshold) {
+        return Out;
+    }
+
+    // ---- Model-view transform (LocalToWorld * WorldToView) ----
+    float4x4 MV     = mul(obj.LocalToWorld, WorldToView);
+    float4   vCenter = mul(float4(splatPos, 1.0f), MV);
+
+    // Cull: behind camera
+    if (vCenter.z < 0.01f) {
+        return Out;
+    }
+
+    float4 clipCenter = mul(vCenter, ViewToClip);
+    float  clipW      = clipCenter.w;
+    if (clipW <= 0.0f) {
+        return Out;
+    }
+
+    // Keep splats alive even when center is slightly outside clip-z range
+    clipCenter.z = clamp(clipCenter.z, 0.0f, clipW);
+
+    // ---- SH view-dependent color ----
+    int maxSHDeg = (int)obj.MaxSHDegree;
+    if (maxSHDeg > 0) {
+        // Camera position in local space of this object
+        float3 localCamPos = mul(float4(CameraPosition, 1.0f), obj.WorldToLocal).xyz;
+        float3 viewDirUE   = normalize(splatPos - localCamPos);
+
+        // Convert view direction to 3DGS coordinate system (RDF)
+        float3 viewDir3DGS = float3(viewDirUE.y, -viewDirUE.z, viewDirUE.x);
+
+        float3 sh1[3], sh2[5], sh3[7];
+        FetchSHGlobal(globalIdx, obj, maxSHDeg, sh1, sh2, sh3);
+        splatColor.rgb += EvaluateSH(viewDir3DGS, maxSHDeg, sh1, sh2, sh3);
+    }
+
+    // Keep the accumulated splat color in the asset's native color space here.
+    // We convert to UE linear only after all splats have been blended together.
+    splatColor.rgb = max(splatColor.rgb, float3(0,0,0));
+
+    float4 rotationQuat = DecodePackedQuaternion(GlobalPackedRotationBuffer[globalIdx]);
+    float3 scale = DecodeGlobalSplatScale(obj, globalIdx, splatIdx);
+
+
+    // ---- Project covariance to 2D ----
+    float3x3 cov3D = BuildCovariance3D(rotationQuat, scale);
+
+    float3 cov2D = ProjectCovariance2D(cov3D, vCenter, FocalLength, ViewportSize, MV);
+
+    // Low-pass filter bias. This is the EWA/Mip-Splatting screen-space filter
+    // term also used by the official 3DGS antialiasing path.
+    float detBeforeFilter = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
+    cov2D.x += 0.1f;
+    cov2D.z += 0.1f;
+    float detAfterFilter = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
+
+    if (EnableAntialiasing != 0u && detBeforeFilter > 0.0f && detAfterFilter > 0.0f)
+    {
+        // Mip-Splatting opacity compensation. Adding the low-pass filter expands
+        // the 2D Gaussian footprint; scale opacity by the determinant ratio so
+        // the filtered splat does not gain energy just because it covers more pixels.
+        splatColor.a *= sqrt(max(0.000025f, detBeforeFilter / detAfterFilter));
+    }
+
+#if RASTER_MODE == 1
+    float3 conic;
+    if (!ComputeConicFromCovariance(cov2D, conic)) {
+        return Out;
+    }
+#else
+    float3 conic = float3(0,0,0);
+#endif
+
+    // ---- Eigen-decomposition to basis vectors ----
+    // bv1/bv2 are the two screen-space ellipse axes with length already baked in.
+    float2 bv1, bv2;
+    float  opacity = splatColor.a;
+    if (!ComputeProjectedExtentBasis(cov2D, SQRT8, obj.SplatScale, opacity, bv1, bv2)) {
+        return Out;
+    }
+    splatColor.a = opacity;
+
+    // ---- Build NDC quad vertex ----
+    float2 corner    = QUAD_CORNERS[cornerIdx];
+    float3 ndcCenter = clipCenter.xyz / clipW;
+
+    // pixel-space basis to NDC offsets (Y axis flipped)
+    // The projected 3D Gaussian becomes a 2D ellipse. Expanding the local square corners
+    // along bv1/bv2 builds the ellipse's oriented bounding quad for rasterization.
+    float2 pixelOffset = corner.x * bv1 + corner.y * bv2;
+    float2 ndcOffset   = pixelOffset * float2(2.0f, -2.0f) / ViewportSize;
+
+#if RASTER_MODE == 1
+    float2 screenCenter;
+    screenCenter.x = ViewportMin.x + (ndcCenter.x * 0.5f + 0.5f) * ViewportSize.x;
+    screenCenter.y = ViewportMin.y + (0.5f - ndcCenter.y * 0.5f) * ViewportSize.y;
+#else
+    float2 screenCenter = float2(0,0);
+#endif
+
+    Out.Position     = float4(ndcCenter.xy + ndcOffset, ndcCenter.z, 1.0f);
+    Out.SplatColor   = splatColor;
+    // Use sqrt(8) sigma as the local-space ellipse extent here (the original 3DGS uses 3 sigma).
+    // In this normalized Gaussian local space, the standard deviation is 1 on each axis.
+    Out.FragPos      = corner * SQRT8;
+    Out.ScreenCenter = screenCenter;
+    Out.Conic        = conic;
+    Out.CenterViewPos = vCenter.xyz;
+
+    return Out;
+}
+
+// ============================================================
+// PIXEL SHADER
+// ============================================================
+float4 GaussianSplatPS(FVSOutput In) : SV_Target0
+{
+    if (UseManualSceneDepthTest != 0u)
+    {
+        float2 outputViewportUV = (float2(In.Position.xy) + 0.5f - ViewportMin) / max(ViewportSize, float2(1e-4f, 1e-4f));
+        outputViewportUV = saturate(outputViewportUV);
+
+        float2 sceneDepthPixel = SceneDepthViewportMin + outputViewportUV * SceneDepthViewportSize;
+        float2 sceneDepthUV = sceneDepthPixel * SceneDepthTextureExtentInverse;
+        float sceneDeviceZ = SceneDepthTexture.SampleLevel(SceneDepthSampler, sceneDepthUV, 0).r;
+        // Compare the current splat pixel against the sampled scene depth and
+        // drop it when UE geometry is closer to the camera.
+        ClipOccludedPixel(In.Position.z, sceneDeviceZ);
+    }
+
+#if RASTER_MODE == 1
+    float2 gaussianDelta = In.ScreenCenter - float2(In.Position.xy);
+    float power = -0.5f * (In.Conic.x * gaussianDelta.x * gaussianDelta.x + In.Conic.z * gaussianDelta.y * gaussianDelta.y) - In.Conic.y * gaussianDelta.x * gaussianDelta.y;
+    if (power > 0.0f) discard;
+    float gaussianWeight = exp(power);
+#else
+    float2 fp = In.FragPos;
+    float A   = dot(fp, fp);
+    if (A > 8.0f) discard;
+    float gaussianWeight = exp(-0.5f * A);
+#endif
+
+    float alpha = min(0.99f, gaussianWeight * In.SplatColor.a);
+
+    if (alpha <= (1.0f / 255.0f)) discard;
+
+    return float4(In.SplatColor.rgb * alpha, alpha);
+}
+
+struct FCompositeVSOutput
+{
+    float4 Position : SV_Position;
+};
+
+FCompositeVSOutput GaussianSplatCompositeVS(uint VertexID : SV_VertexID)
+{
+    FCompositeVSOutput Out;
+
+    // Generate a fullscreen triangle in NDC. The vertices extend past the
+    // [-1, +1] screen bounds on purpose so a single triangle covers the
+    // entire viewport without needing a quad made of two triangles.
+    float2 pos;
+    if (VertexID == 0)
+    {
+        pos = float2(-1.0f, -1.0f);
+    }
+    else if (VertexID == 1)
+    {
+        pos = float2(-1.0f, 3.0f);
+    }
+    else
+    {
+        pos = float2(3.0f, -1.0f);
+    }
+
+    Out.Position = float4(pos, 0.0f, 1.0f);
+    return Out;
+}
+
+Texture2D GaussianAccumTexture;
+uint ConvertOutputToLinear;
+
+float4 GaussianSplatCompositePS(FCompositeVSOutput In) : SV_Target0
+{
+    int2 pixelCoord = int2(In.Position.xy);
+    float4 accum = GaussianAccumTexture.Load(int3(pixelCoord, 0));
+    float alpha = saturate(accum.a);
+
+    if (alpha <= 1e-4f)
+    {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    float3 color = max(accum.rgb, float3(0.0f, 0.0f, 0.0f));
+    if (ConvertOutputToLinear != 0u)
+    {
+        color = SRGBToLinear(saturate(color));
+    }
+
+    return float4(color * PreExposure, alpha);
+}

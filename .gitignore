@@ -1,0 +1,26 @@
+# Unreal Engine generated directories
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# IDE / local workspace files
+.vs/
+.vscode/
+Tools/
+*.sln
+*.suo
+*.user
+*.userosscache
+*.VC.db
+*.VC.opendb
+*.code-workspace
+
+# Logs and temporary files
+*.log
+*.tmp
+*.cache
+
+# User-local Unreal content
+Content/Developers/
+Content/Collections/

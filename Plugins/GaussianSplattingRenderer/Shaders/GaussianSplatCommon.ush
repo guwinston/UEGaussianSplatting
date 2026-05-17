@@ -1,0 +1,307 @@
+// GaussianSplatCommon.ush
+// Shared math utilities for 3D Gaussian Splatting rendering
+// Reference implementations:
+//   - 3DGS original (INRIA): https://github.com/graphdeco-inria/gaussian-splatting
+//   - VK/Slang adaptation: https://github.com/nvpro-samples/vk_gaussian_splatting
+
+#pragma once
+
+// Spherical Harmonics constants
+static const float SH_C0 = 0.28209479177387814f;   // 1 / (2 * sqrt(pi))
+static const float SH_C1 = 0.4886025119029199f;     // sqrt(3/(4*pi))
+static const float SH_C2_0 = 1.0925484305920792f;   // 0.5 * sqrt(15/pi)
+static const float SH_C2_1 = -1.0925484305920792f;  // -0.5 * sqrt(15/pi)
+static const float SH_C2_2 = 0.31539156525252005f;  // 0.25 * sqrt(5/pi)
+static const float SH_C2_3 = -1.0925484305920792f;  // -0.5 * sqrt(15/pi)
+static const float SH_C2_4 = 0.5462742152960396f;   // 0.25 * sqrt(15/pi)
+static const float SH_C3_0 = -0.5900435899266435f;
+static const float SH_C3_1 = 2.890611442640554f;
+static const float SH_C3_2 = -0.4570457994644658f;
+static const float SH_C3_3 = 0.3731763325901154f;
+static const float SH_C3_4 = -0.4570457994644658f;
+static const float SH_C3_5 = 1.445305721320277f;
+static const float SH_C3_6 = -0.5900435899266435f;
+
+// sqrt(8) - splats are scaled to this many standard deviations
+static const float SQRT8 = 2.8284271247461903f;
+
+/**
+ * Compute 3D covariance matrix from scale (log-space) and rotation (quaternion)
+ * Returns a 3x3 symmetric matrix: Sigma = R * S^2 * R^T
+ * 
+ * Scale is stored as log(s) in the .ply file, so we apply exp() first.
+ * Rotation is stored as (qw, qx, qy, qz) quaternion (normalized).
+ * 
+ * NOTE: This function is provided as a reference but the actual covariance
+ * is precomputed on the CPU (GaussianSplatPlyLoader.cpp) and stored in the
+ * CovarianceBuffer. This GPU version exists for potential future use.
+ */
+float3x3 ComputeCov3D(float3 logScale, float4 rotation)
+{
+    float3 scale = exp(logScale);
+
+    // Normalize quaternion (stored as qw,qx,qy,qz)
+    float4 q = normalize(rotation);
+    float qw = q.x;  // w component
+    float qx = q.y;
+    float qy = q.z;
+    float qz = q.w;
+
+    // Build rotation matrix R from quaternion (standard formula)
+    // R[row][col] in row-major HLSL
+    float3x3 R = float3x3(
+        1.0f - 2.0f * (qy*qy + qz*qz),  2.0f * (qx*qy - qw*qz),          2.0f * (qx*qz + qw*qy),
+        2.0f * (qx*qy + qw*qz),          1.0f - 2.0f * (qx*qx + qz*qz),  2.0f * (qy*qz - qw*qx),
+        2.0f * (qx*qz - qw*qy),          2.0f * (qy*qz + qw*qx),          1.0f - 2.0f * (qx*qx + qy*qy)
+    );
+
+    // Sigma = R * S^2 * R^T  (standard 3DGS formula)
+    // This equals M * M^T where M = R * diag(scale)
+    // In HLSL (row-major): Sigma[i][j] = sum_k R[i][k] * scale[k]^2 * R[j][k]
+    float sx2 = scale.x * scale.x;
+    float sy2 = scale.y * scale.y;
+    float sz2 = scale.z * scale.z;
+
+    // Build Sigma directly
+    float3x3 Sigma;
+    Sigma[0][0] = R[0][0]*sx2*R[0][0] + R[0][1]*sy2*R[0][1] + R[0][2]*sz2*R[0][2];
+    Sigma[0][1] = R[0][0]*sx2*R[1][0] + R[0][1]*sy2*R[1][1] + R[0][2]*sz2*R[1][2];
+    Sigma[0][2] = R[0][0]*sx2*R[2][0] + R[0][1]*sy2*R[2][1] + R[0][2]*sz2*R[2][2];
+    Sigma[1][0] = Sigma[0][1];
+    Sigma[1][1] = R[1][0]*sx2*R[1][0] + R[1][1]*sy2*R[1][1] + R[1][2]*sz2*R[1][2];
+    Sigma[1][2] = R[1][0]*sx2*R[2][0] + R[1][1]*sy2*R[2][1] + R[1][2]*sz2*R[2][2];
+    Sigma[2][0] = Sigma[0][2];
+    Sigma[2][1] = Sigma[1][2];
+    Sigma[2][2] = R[2][0]*sx2*R[2][0] + R[2][1]*sy2*R[2][1] + R[2][2]*sz2*R[2][2];
+    return Sigma;
+}
+
+/**
+ * Project 3D covariance to 2D screen space using EWA splatting approximation
+ * (Zwicker et al. 2002, "EWA Volume Splatting")
+ *
+ * Mathematical derivation:
+ *   In column-vector convention: cov2D = J * W * cov3D * W^T * J^T
+ *   where:
+ *     J = Jacobian of perspective projection (affine approximation)
+ *     W = rotation part of ModelView matrix (column-vector convention)
+ *
+ * In UE/HLSL row-vector convention:
+ *   - modelViewTransform satisfies: v_view = v_model * modelViewTransform
+ *   - So W_col = modelViewTransform^T [upper 3x3]
+ *   - Let Mrot = upper 3x3 of modelViewTransform (row-major)
+ *   - Then W_col = Mrot^T
+ *   - In row-major: T = J * W_col = J * Mrot^T
+ *   - cov2D = T * cov3D * T^T  (same formula, just different matrix convention)
+ *
+ * Inputs:
+ *   cov3Dm: 3x3 symmetric covariance in model space (same units as positions)
+ *   splatCenterView: splat center in view space (z > 0 means in front of camera)
+ *   focal: (fx, fy) focal lengths in pixels
+ *   viewportSize: viewport size in pixels
+ *   modelViewTransform: 4x4 row-major model-view matrix
+ *
+ * Returns: upper-left 2x2 of projected covariance as (cov_xx, cov_xy, cov_yy)
+    // These are in units of pixels^2 (since J maps model-space to pixel-space)
+ */
+float3 ProjectCovariance2D(float3x3 cov3Dm, float4 splatCenterView, float2 focal, float2 viewportSize, float4x4 modelViewTransform)
+{
+    // Clamp z to a minimum safe value to avoid division by zero / numerical explosion.
+    // 0.1 cm = 0.001 m is a safe minimum; the VS already culls z < 0.01 cm.
+    float z = max(splatCenterView.z, 0.1f);
+
+    // Match the original CUDA path: clamp the projected center direction to a slightly
+    // dilated frustum before building the projection Jacobian. This keeps near-frustum
+    // and off-screen splats numerically stable and preserves edge detail better.
+    float safeFx = max(abs(focal.x), 1e-6f);
+    float safeFy = max(abs(focal.y), 1e-6f);
+    float tanHalfFovX = 0.5f * viewportSize.x / safeFx;
+    float tanHalfFovY = 0.5f * viewportSize.y / safeFy;
+    float limx = 1.3f * tanHalfFovX;
+    float limy = 1.3f * tanHalfFovY;
+
+    float3 t = splatCenterView.xyz;
+    float txtz = t.x / z;
+    float tytz = t.y / z;
+    t.x = clamp(txtz, -limx, limx) * z;
+    t.y = clamp(tytz, -limy, limy) * z;
+
+    float z2 = z * z;
+    float s = 1.0f / z2;
+
+    // Jacobian J of perspective projection (affine approximation)
+    // Maps 3D view-space offsets to 2D screen-space (pixel) offsets.
+    // We keep the UE row-vector convention and account for screen Y pointing down.
+    float3x3 J = float3x3(
+        focal.x / z,  0.0f,   -(focal.x * t.x) * s,
+        0.0f,        -focal.y / z,  (focal.y * t.y) * s,
+        0.0f,         0.0f,    0.0f
+    );
+
+    // Extract upper-left 3x3 rotation part of the model-view transform.
+    // In HLSL, modelViewTransform[i].xyz = row i of the matrix.
+    float3x3 Mrot = float3x3(
+        modelViewTransform[0].xyz,
+        modelViewTransform[1].xyz,
+        modelViewTransform[2].xyz
+    );
+    // W = Mrot^T converts row-major convention to column-major W
+    // (so that T = J * W is correct for the cov2D formula)
+    float3x3 W = transpose(Mrot);
+
+    // T = J * W  (3x3, upper two rows contain the projection)
+    float3x3 T = mul(J, W);
+
+    // cov2D = T * cov3D * T^T
+    // (Since cov3D is symmetric, this is equivalent to the column-vector formula)
+    float3x3 cov2Dm = mul(mul(T, cov3Dm), transpose(T));
+
+    // Return upper-left 2x2 as (cov_xx, cov_xy, cov_yy)
+    // These are in units of pixels^2 (since J maps model-space to pixel-space)
+    return float3(cov2Dm[0][0], cov2Dm[0][1], cov2Dm[1][1]);
+}
+
+/**
+ * Compute 2D basis vectors from the projected covariance
+ * Uses eigen-decomposition of the 2x2 covariance matrix
+ * 
+ * cov2Dv: (cov_xx, cov_xy, cov_yy) in pixels^2 -- modified in place (anti-aliasing bias added)
+ * stdDev: number of standard deviations for the splat extent (sqrt8 = ~2.83)
+ * splatScale: global scale multiplier
+ * opacity: [inout] not modified in this version (MIP-splatting alpha comp disabled)
+ * basisVector1, basisVector2: [out] screen-space basis vectors in pixels
+ *   basisVector1 points along major axis, length = stdDev * sqrt(eigenValue1)
+ *   basisVector2 is perpendicular, length = stdDev * sqrt(eigenValue2)
+ *
+ * Returns false if the splat is degenerate (negative eigenvalue or zero diagonal)
+ */
+bool ComputeProjectedExtentBasis(inout float3 cov2Dv, float stdDev, float splatScale,
+                                  inout float opacity, out float2 basisVector1, out float2 basisVector2)
+{
+    // cov2Dv is expected to already include the 0.1px low-pass filter bias.
+
+    // Solve 2x2 symmetric eigenvalue problem
+    // Matrix: [a  b]
+    //         [b  d]
+    float a = cov2Dv.x;
+    float b = cov2Dv.y;
+    float d = cov2Dv.z;
+
+    // Eigenvalues: lambda = (trace/2) +/- sqrt((trace/2)^2 - det)
+    float trace      = a + d;
+    float traceHalf  = 0.5f * trace;
+    float det        = a * d - b * b;
+    float discriminant = traceHalf * traceHalf - det;
+    float term2      = sqrt(max(0.0f, discriminant));
+
+    float eigenValue1 = traceHalf + term2;  // larger eigenvalue
+    float eigenValue2 = traceHalf - term2;  // smaller eigenvalue
+
+    // Degenerate case: negative eigenvalue means the covariance is not positive semi-definite
+    if (eigenValue2 <= 0.0f)
+    {
+        basisVector1 = float2(0, 0);
+        basisVector2 = float2(0, 0);
+        return false;
+    }
+
+    // Solve the principal-axis direction with the half-angle form for the
+    // symmetric 2x2 covariance [a b; b d]. This keeps one continuous formula
+    // for both axis-aligned and rotated ellipses, and avoids the wrong fallback
+    // that the explicit eigenvector form can produce when b is near zero.
+    //
+    // The ellipse rotation satisfies:
+    //   tan(2 * theta) = (2 * b) / (a - d)
+    // so we compute:
+    //   theta = 0.5 * atan2(2 * b, a - d)
+    //
+    // The resulting unit eigenvectors are:
+    //   major axis: [ cos(theta),  sin(theta)]
+    //   minor axis: [-sin(theta),  cos(theta)]
+    float angle = 0.5f * atan2(2.0f * b, a - d);
+    float2 eigenVector1 = float2(cos(angle), sin(angle));
+    float2 eigenVector2 = float2(-eigenVector1.y, eigenVector1.x);
+
+    // These are in units of pixels^2 (since J maps model-space to pixel-space)
+    // Use a generous cap so near-camera large splats are not prematurely truncated.
+    // Use sqrt(8) sigma here; this 2D Gaussian extent covers about 98.2% of the
+    // distribution, which is a practical quality/performance tradeoff versus 3 sigma (covers 98.9%).
+    float maxSplatPixels = 2048.0f;
+    basisVector1 = eigenVector1 * splatScale * min(stdDev * sqrt(eigenValue1), maxSplatPixels);
+    basisVector2 = eigenVector2 * splatScale * min(stdDev * sqrt(eigenValue2), maxSplatPixels);
+
+    return true;
+}
+
+bool ComputeConicFromCovariance(float3 cov2Dv, out float3 conic)
+{
+    float det = cov2Dv.x * cov2Dv.z - cov2Dv.y * cov2Dv.y;
+    if (det <= 0.0f)
+    {
+        conic = float3(0.0f, 0.0f, 0.0f);
+        return false;
+    }
+
+    float detInv = 1.0f / det;
+    conic = float3(cov2Dv.z * detInv, -cov2Dv.y * detInv, cov2Dv.x * detInv);
+    return true;
+}
+
+/**
+ * Evaluate Spherical Harmonics radiance for a given view direction
+ * SH degree 0 is DC component (constant color), stored separately in ColorBuffer
+ * This function evaluates degrees 1-3 from the SHBuffer
+ *
+ * viewDir: normalized view direction (from camera to splat, in model/local space)
+ *          Same convention as original 3DGS: dir = (splat_pos - camera_pos)
+ * degree: maximum degree to evaluate (1-3)
+ * shDeg1: 3 float3 coefficients (SH band 1: l=1, m=-1,0,+1)
+ * shDeg2: 5 float3 coefficients (SH band 2: l=2)
+ * shDeg3: 7 float3 coefficients (SH band 3: l=3)
+ *
+ * Returns: RGB radiance contribution from higher-order SH bands
+ *          (DC contribution SH_C0 * dc is already in ColorBuffer)
+ */
+float3 EvaluateSH(float3 viewDir, int degree,
+                  float3 shDeg1[3], float3 shDeg2[5], float3 shDeg3[7])
+{
+    float3 rgb = float3(0, 0, 0);
+
+    if (degree >= 1)
+    {
+        float x = viewDir.x;
+        float y = viewDir.y;
+        float z = viewDir.z;
+
+        // Band 1: l=1, m=-1,0,+1
+        // Y_1^-1(theta, phi) ~ y,  Y_1^0 ~ z,  Y_1^1 ~ x
+        rgb += SH_C1 * (-shDeg1[0] * y + shDeg1[1] * z - shDeg1[2] * x);
+
+        if (degree >= 2)
+        {
+            float xx = x*x, yy = y*y, zz = z*z;
+            float xy = x*y, yz = y*z, xz = x*z;
+
+            // Band 2: l=2, m=-2,-1,0,+1,+2
+            rgb += SH_C2_0 * xy        * shDeg2[0]
+                +  SH_C2_1 * yz        * shDeg2[1]
+                +  SH_C2_2 * (2.0f*zz - xx - yy) * shDeg2[2]
+                +  SH_C2_3 * xz        * shDeg2[3]
+                +  SH_C2_4 * (xx - yy) * shDeg2[4];
+
+            if (degree >= 3)
+            {
+                // Band 3: l=3
+                rgb += SH_C3_0 * y * (3.0f*xx - yy)        * shDeg3[0]
+                    +  SH_C3_1 * xy * z                     * shDeg3[1]
+                    +  SH_C3_2 * y * (4.0f*zz - xx - yy)   * shDeg3[2]
+                    +  SH_C3_3 * z * (2.0f*zz - 3.0f*xx - 3.0f*yy) * shDeg3[3]
+                    +  SH_C3_4 * x * (4.0f*zz - xx - yy)   * shDeg3[4]
+                    +  SH_C3_5 * z * (xx - yy)              * shDeg3[5]
+                    +  SH_C3_6 * x * (xx - 3.0f*yy)        * shDeg3[6];
+            }
+        }
+    }
+
+    return rgb;
+}

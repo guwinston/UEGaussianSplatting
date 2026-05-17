@@ -1,0 +1,29 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "GaussianSplattingRenderer",
+	"Description": "Unreal Engine 5 renderer plugin for 3D Gaussian Splatting (3DGS). Uses a native rendering pipeline path and supports .ply import, runtime loading, and editor selection.",
+	"Category": "Rendering",
+	"CreatedBy": "UnrealSplatting",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "GaussianSplatting",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "GaussianSplattingEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}
