@@ -6,6 +6,7 @@
 #include "GaussianSplatSceneProxy.h"
 #include "RHIResources.h"
 #include "RenderGraphResources.h"
+#include "Misc/EngineVersionComparison.h"
 
 // Forward declarations: avoid including private/renderer headers in this public header.
 struct FPostProcessingInputs;
@@ -71,7 +72,9 @@ public:
 
     virtual void SubscribeToPostProcessingPass(
         EPostProcessingPass Pass,
+#if !UE_VERSION_OLDER_THAN(5, 5, 0)
         const FSceneView& InView,
+#endif
         FAfterPassCallbackDelegateArray& InOutPassCallbacks,
         bool bIsPassEnabled) override;
 

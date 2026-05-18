@@ -3,6 +3,7 @@
 #include "GaussianSplatActor.h"
 #include "GaussianSplatAsset.h"
 #include "GaussianSplatComponent.h"
+#include "Misc/EngineVersionComparison.h"
 
 #define LOCTEXT_NAMESPACE "GaussianSplattingActorFactory"
 
@@ -14,7 +15,9 @@ UActorFactoryGaussianSplatAsset::UActorFactoryGaussianSplatAsset(const FObjectIn
     bShowInEditorQuickMenu = true;
     bUseSurfaceOrientation = true;
     // We register this factory manually via the editor module; prevent duplicate auto-registration.
+#if !UE_VERSION_OLDER_THAN(5, 5, 0)
     bShouldAutoRegister = false;
+#endif
 }
 
 bool UActorFactoryGaussianSplatAsset::CanCreateActorFrom(const FAssetData& AssetData, FText& OutErrorMsg)

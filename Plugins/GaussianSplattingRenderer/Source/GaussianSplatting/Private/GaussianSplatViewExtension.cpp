@@ -21,6 +21,15 @@
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "Misc/EngineVersionComparison.h"
 
+// UE 5.4 doesn't have RDG_EVENT_SCOPE_STAT; emulate it with the plain event scope.
+// The companion RDG_GPU_STAT_SCOPE call (already present below each usage) covers the GPU stat.
+#if UE_VERSION_OLDER_THAN(5, 5, 0)
+    #ifndef RDG_EVENT_SCOPE_STAT
+        #define RDG_EVENT_SCOPE_STAT(GraphBuilder, StatName, Format, ...) \
+            RDG_EVENT_SCOPE(GraphBuilder, Format, ##__VA_ARGS__)
+    #endif
+#endif
+
 DECLARE_GPU_STAT_NAMED(GaussianSplat, TEXT("Gaussian Splat"));
 DECLARE_GPU_STAT_NAMED(GaussianSplatAccumulate, TEXT("Gaussian Splat Accumulate"));
 DECLARE_GPU_STAT_NAMED(GaussianSplatComposite, TEXT("Gaussian Splat Composite"));
@@ -58,7 +67,11 @@ static FScreenPassTexture CreateWritablePostProcessSceneColor(
     }
 
     FScreenPassTexture Output(OutputTexture, SceneColorSlice.ViewRect);
+#if UE_VERSION_OLDER_THAN(5, 5, 0)
+    return FScreenPassTexture::CopyFromSlice(GraphBuilder, SceneColorSlice);
+#else
     return FScreenPassTexture::CopyFromSlice(GraphBuilder, SceneColorSlice, Output);
+#endif
 }
 
 }
@@ -693,10 +706,10 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     }
     if (!SortedIndexSRV || !DrawIndirectArgsBuffer) return;
 
-    const bool bUseManualSceneDepthTest = SceneDepthTexture != nullptr && InView.bIsViewInfo
-        && static_cast<const FViewInfo&>(InView).ViewRect.Size() != ViewRect.Size();
-
     const FViewInfo* ViewInfo = InView.bIsViewInfo ? &static_cast<const FViewInfo&>(InView) : nullptr;
+    const FIntRect SceneDepthViewRect = ViewInfo ? ViewInfo->ViewRect : ViewRect;
+    const bool bUseManualSceneDepthTest = SceneDepthTexture != nullptr && ViewInfo
+        && SceneDepthViewRect != ViewRect;
 
     // 7. Build accumulation pass parameters and issue the merged splat draw call.
     FGaussianSplatPassParameters* PassParams = GraphBuilder.AllocParameters<FGaussianSplatPassParameters>();
@@ -746,8 +759,8 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         PassParams->PS.ViewportSize = FVector2f(VW, VH);
         PassParams->PS.SceneDepthTexture = SceneDepthTexture ? SceneDepthTexture : GSystemTextures.GetBlackDummy(GraphBuilder);
         PassParams->PS.SceneDepthSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-        PassParams->PS.SceneDepthViewportMin = FVector2f(VMinX, VMinY);
-        PassParams->PS.SceneDepthViewportSize = FVector2f(VW, VH);
+        PassParams->PS.SceneDepthViewportMin = FVector2f((float)SceneDepthViewRect.Min.X, (float)SceneDepthViewRect.Min.Y);
+        PassParams->PS.SceneDepthViewportSize = FVector2f((float)SceneDepthViewRect.Width(), (float)SceneDepthViewRect.Height());
         PassParams->PS.SceneDepthTextureExtentInverse = SceneDepthTexture
             ? FVector2f(1.0f / (float)SceneDepthTexture->Desc.Extent.X, 1.0f / (float)SceneDepthTexture->Desc.Extent.Y)
             : FVector2f::ZeroVector;
@@ -895,7 +908,9 @@ void FGaussianSplatViewExtension::PrePostProcessPass_RenderThread(
 
 void FGaussianSplatViewExtension::SubscribeToPostProcessingPass(
     EPostProcessingPass Pass,
+#if !UE_VERSION_OLDER_THAN(5, 5, 0)
     const FSceneView& InView,
+#endif
     FAfterPassCallbackDelegateArray& InOutPassCallbacks,
     bool bIsPassEnabled)
 {

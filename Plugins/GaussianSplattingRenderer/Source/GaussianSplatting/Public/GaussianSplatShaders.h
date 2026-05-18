@@ -8,6 +8,7 @@
 #include "RHICommandList.h"
 #include "ShaderPermutation.h"
 #include "SceneView.h"
+#include "DataDrivenShaderPlatformInfo.h"
 
 // ============================================================
 //  GPU Object Cull Compute Shader
