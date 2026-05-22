@@ -134,7 +134,7 @@ For one axis, the quantization step is:
 
 $$
 \Delta_x^{(c)}=
-\frac{p_{max,x}^{(c)}-p_{min,x}^{(c)}}{65535}
+\frac{p_{max}^{(c)}.x-p_{min}^{(c)}.x}{65535}
 $$
 
 and the maximum absolute error bound is:

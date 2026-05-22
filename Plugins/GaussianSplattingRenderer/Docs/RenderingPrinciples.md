@@ -92,7 +92,7 @@ The current direction conversion from source coordinates to UE coordinates is:
 
 $$
 d_{ue} =
-(d_{src,z}, d_{src,x}, -d_{src,y})^T
+(d_{src}.z, d_{src}.x, -d_{src}.y)^T
 $$
 
 This means:
@@ -192,7 +192,7 @@ For `rotation`, the current code does not rely only on an abstract change-of-bas
 
 $$
 d_{ue} =
-(d_{src,z}, d_{src,x}, -d_{src,y})^T
+(d_{src}.z, d_{src}.x, -d_{src}.y)^T
 $$
 
 4. Rebuild the UE rotation from the converted UE local `X` and `Y` axes.
@@ -221,7 +221,7 @@ Before SH evaluation, the current implementation maps the UE view direction back
 
 $$
 v_{3dgs} =
-(v_{ue,y}, -v_{ue,z}, v_{ue,x})^T
+(v_{ue}.y, -v_{ue}.z, v_{ue}.x)^T
 $$
 
 This is the inverse of the earlier `UE = (Z, X, -Y)` mapping. The reason is simple: the model has been placed in UE space, but the SH coefficients are still stored in the original 3DGS direction semantics. If the evaluation direction is not mapped back, view-dependent color will be rotated incorrectly. This shows up as incorrect highlight direction, shifted brightness response, or wrong angular color dependence.
@@ -459,7 +459,7 @@ Since converting from clip space to NDC only requires the homogeneous divide, an
 
 $$
 p_{clip,out} =
-(p_{ndc,x}, p_{ndc,y}, p_{ndc,z}, 1)^T
+(p_{ndc}.x, p_{ndc}.y, p_{ndc}.z, 1)^T
 $$
 
 This is why the shader computes `ndcCenter`, adds `ndcOffset`, and outputs `float4(ndcCenter.xy + ndcOffset, ndcCenter.z, 1.0)`.
@@ -542,7 +542,7 @@ The shader maps the UE local view direction back to the 3DGS direction conventio
 
 $$
 v_{3dgs} =
-(v_{ue,y}, -v_{ue,z}, v_{ue,x})^T
+(v_{ue}.y, -v_{ue}.z, v_{ue}.x)^T
 $$
 
 The reason is that SH coefficients were trained under the original 3DGS coordinate system. Evaluation must use the same direction convention, otherwise view-dependent color will be misaligned.

@@ -93,7 +93,7 @@ $$
 
 $$
 d_{ue} =
-(d_{src,z}, d_{src,x}, -d_{src,y})^T
+(d_{src}.z, d_{src}.x, -d_{src}.y)^T
 $$
 
 这意味着：
@@ -193,7 +193,7 @@ $$
 
 $$
 d_{ue} =
-(d_{src,z}, d_{src,x}, -d_{src,y})^T
+(d_{src}.z, d_{src}.x, -d_{src}.y)^T
 $$
 
 4. 再用转换后的 UE 局部 `X` 轴和 UE 局部 `Y` 轴，重新构造 UE 旋转。
@@ -222,7 +222,7 @@ $$
 
 $$
 v_{3dgs} =
-(v_{ue,y}, -v_{ue,z}, v_{ue,x})^T
+(v_{ue}.y, -v_{ue}.z, v_{ue}.x)^T
 $$
 
 这其实就是前面 `UE = ( Z, X, -Y )` 的逆映射。原因很简单：如果模型已经被放进 UE 世界里，但 SH 仍按原始 3DGS 的方向语义存储，那么求值方向若不反向映射回去，视角相关颜色项就会发生偏转，表现为高光方向、明暗变化或者颜色角度依赖全部出错。
@@ -468,7 +468,7 @@ $$
 
 $$
 p_{clip,out} =
-(p_{ndc,x}, p_{ndc,y}, p_{ndc,z}, 1)^T
+(p_{ndc}.x, p_{ndc}.y, p_{ndc}.z, 1)^T
 $$
 
 这也是为什么当前 shader 里会先得到 `ndcCenter`，再加上 `ndcOffset`，最后直接输出 `float4(ndcCenter.xy + ndcOffset, ndcCenter.z, 1.0)`。
@@ -551,7 +551,7 @@ clipCenter = mul(vCenter, ViewToClip)
 
 $$
 v_{3dgs} =
-(v_{ue,y}, -v_{ue,z}, v_{ue,x})^T
+(v_{ue}.y, -v_{ue}.z, v_{ue}.x)^T
 $$
 
 原因是 SH 系数是按原始 3DGS 坐标系训练出来的，求值时必须回到同一套方向约定，否则视角相关颜色会错位。
