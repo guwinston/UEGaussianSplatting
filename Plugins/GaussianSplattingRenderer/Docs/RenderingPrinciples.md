@@ -62,7 +62,7 @@ This performs two things at once:
 For position alone, this can be viewed as:
 
 $$
-p_{ue} = 100 \, M \, p_{src}
+p_{ue} = 100 \thinspace M \thinspace p_{src}
 $$
 
 where `M` is the 3x3 axis mapping matrix chosen by the project.
@@ -173,7 +173,7 @@ $$
 More completely:
 
 $$
-s_{ue} = 100 \, s_{src}
+s_{ue} = 100 \thinspace s_{src}
 $$
 
 and under `log-scale` representation:
@@ -208,7 +208,7 @@ This does not mean the Gaussian is being rotated again. It means the same local 
 Once `rotation` and `scale` are both interpreted under UE semantics, the corresponding 3D covariance can be written as:
 
 $$
-\Sigma_{3D} = R_{ue} \, S_{ue}^{2} \, R_{ue}^{T}
+\Sigma_{3D} = R_{ue} \thinspace S_{ue}^{2} \thinspace R_{ue}^{T}
 $$
 
 Here $R_{ue}$ is the rotation matrix under the UE basis, and $S_{ue}$ is the axis-aligned scale matrix under UE semantics. Together, they define the 3D ellipsoid shape of the splat in UE space. Later view-space transformation and projection-Jacobian mapping both operate on this already unified UE covariance.
@@ -554,13 +554,13 @@ This is the central step of the rendering path.
 The shape of a 3D Gaussian is described by a $3 \times 3$ covariance matrix. Since `rotation + scale` have already been converted into UE semantics during import and compression, the vertex shader can construct the 3D covariance directly from UE-space rotation and scale:
 
 $$
-\Sigma_{3D} = R_{ue} \, S_{ue}^{2} \, R_{ue}^{T}
+\Sigma_{3D} = R_{ue} \thinspace S_{ue}^{2} \thinspace R_{ue}^{T}
 $$
 
 It is then approximately projected into screen space through the projection Jacobian:
 
 $$
-\Sigma_{2D} = J \, W \, \Sigma_{3D} \, W^{T} \, J^{T}
+\Sigma_{2D} = J \thinspace W \thinspace \Sigma_{3D} \thinspace W^{T} \thinspace J^{T}
 $$
 
 where:
@@ -764,7 +764,7 @@ The UE path uses standard back-to-front alpha-over blending. Farther splats are 
 We can compare this directly with the original 3DGS formulation. Let the effective opacity of splat $i$ at the current pixel be:
 
 $$
-\alpha_i = o_i \, w_i
+\alpha_i = o_i \thinspace w_i
 $$
 
 where:
@@ -778,7 +778,7 @@ where:
 Original 3DGS is often written as a front-to-back volume-rendering recurrence. Splats are ordered from near to far, and a remaining transmittance $T$ is maintained:
 
 $$
-C \leftarrow C + T \, \alpha_i \, c_i
+C \leftarrow C + T \thinspace \alpha_i \thinspace c_i
 $$
 
 $$
@@ -813,13 +813,47 @@ This is the classic transparent `over` rule. It works for Gaussian splats becaus
 - multiple splats must be layered from far to near in the final image
 - each nearer layer attenuates the already accumulated contribution behind it
 
-Expanded across many layers, the current UE path is equivalent to:
+Using the same index convention as section 8.1, splat $1$ is the nearest splat and splat $N$ is the farthest splat. The current UE path therefore draws them in the opposite order, from $N$ down to $1$. To expand UE's `src over dst` rule, let $C^{(m)}$ denote the color after splats $N, N-1, \ldots, m$ have already been drawn.
+
+Before any Gaussian contribution is drawn:
 
 $$
-C_{out} = \alpha_N c_N + (1-\alpha_N)\alpha_{N-1}c_{N-1} + \cdots + \left(\prod_{j=2}^{N}(1-\alpha_j)\right)\alpha_1 c_1
+C^{(N+1)} = 0
 $$
 
-If the indices are ordered from far to near, this matches the front-to-back result above.
+When splat $m$ is drawn as the new `src` over the already composited `dst`, the recurrence is:
+
+$$
+C^{(m)} = \alpha_m c_m + (1-\alpha_m) C^{(m+1)}
+$$
+
+Expanding this recurrence from far to near gives the first few steps:
+
+$$
+C^{(N)} = \alpha_N c_N
+$$
+
+$$
+C^{(N-1)} = \alpha_{N-1}c_{N-1} + (1-\alpha_{N-1})\alpha_N c_N
+$$
+
+$$
+C^{(N-2)} = \alpha_{N-2}c_{N-2} + (1-\alpha_{N-2})\alpha_{N-1}c_{N-1} + (1-\alpha_{N-2})(1-\alpha_{N-1})\alpha_N c_N
+$$
+
+After the recurrence reaches the nearest splat $1$, the final result is:
+
+$$
+C_{out} = \alpha_1 c_1 + (1-\alpha_1)\alpha_2 c_2 + \cdots + \left(\prod_{j=1}^{N-1}(1-\alpha_j)\right)\alpha_N c_N
+$$
+
+The Gaussian indices therefore still follow the same near-to-far convention as section 8.1. Only the actual UE draw order is reversed: the farthest splat $N$ is drawn first, and the nearest splat $1$ is drawn last. The current sorting key uses negative view-space depth:
+
+$$
+k_i = \mathrm{SortableUint}(-z_i)
+$$
+
+When UE's GPU sort outputs keys in ascending order, farther splats have smaller $-z_i$ values and therefore appear earlier in the sorted stream. The first sorted splat is consequently the farthest splat, which is exactly the order required by back-to-front `over` compositing.
 
 ### 8.3 Relation Between the Two and Sorting Direction
 
@@ -830,7 +864,7 @@ The two forms are mathematically equivalent, but they maintain different recurre
 
 Therefore, the main difference is not the final result, but the sorting direction.
 
-For original 3DGS front-to-back accumulation, sorting is usually from small depth to large depth, or near to far. In the current UE back-to-front `over` path, sorting must be from large depth to small depth, or far to near. This is why the GPU sorting direction here is the opposite of the original 3DGS sorting direction, even though both serve the same goal: matching the blending recurrence with the ordering it mathematically requires.
+For original 3DGS front-to-back accumulation, sorting is usually from small depth to large depth, or near to far. In the current UE back-to-front `over` path, the draw order must be from large depth to small depth, or far to near. This is why the current implementation builds an ascending sort key from negative depth: the first visible splat in the sorted output stream corresponds to the farthest Gaussian. The GPU sorting direction here is the opposite of the original 3DGS accumulation direction, even though both serve the same goal: matching the blending recurrence with the ordering it mathematically requires.
 
 This also explains why sorting and blending must be paired correctly. If the order is wrong, the problem is not just that the image becomes slightly worse; the mathematical meaning of alpha accumulation is broken, and the final image can become obviously incorrect.
 

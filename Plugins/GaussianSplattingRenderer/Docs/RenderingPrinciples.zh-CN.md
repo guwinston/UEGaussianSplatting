@@ -63,7 +63,7 @@ FVector(
 因此，单就位置而言，可以把这一步理解为：
 
 $$
-p_{ue} = 100 \, M \, p_{src}
+p_{ue} = 100 \thinspace M \thinspace p_{src}
 $$
 
 其中 `M` 就是当前项目约定的 3x3 轴映射矩阵。
@@ -174,7 +174,7 @@ $$
 如果写成更完整的形式，那么尺度的转换可以表示为：
 
 $$
-s_{ue} = 100 \, s_{src}
+s_{ue} = 100 \thinspace s_{src}
 $$
 
 而在 `log-scale` 表示下，对应变成：
@@ -209,7 +209,7 @@ $$
 因此，一旦 `rotation` 和 `scale` 都已经按 UE 语义被解释，那么对应的 3D 协方差就可以直接写成：
 
 $$
-\Sigma_{3D} = R_{ue} \, S_{ue}^{2} \, R_{ue}^{T}
+\Sigma_{3D} = R_{ue} \thinspace S_{ue}^{2} \thinspace R_{ue}^{T}
 $$
 
 这里的 $R_{ue}$ 表示 UE 基底下的旋转矩阵， $S_{ue}$ 表示 UE 语义下的轴向尺度矩阵。它们共同决定了 splat 在 UE 空间中的 3D 椭球形状。后续无论是做 view-space 变换，还是通过投影 Jacobian 映射到屏幕空间，都是在这个已经统一好的 UE 协方差基础上继续进行。
@@ -563,13 +563,13 @@ $$
 3D Gaussian 的形状由一个 $3 \times 3$ 协方差矩阵描述。由于 `rotation + scale` 在导入和压缩阶段就已经被统一成 UE 语义，所以顶点着色器这里只需要直接根据 UE 语义的旋转和尺度构建 3D 协方差：
 
 $$
-\Sigma_{3D} = R_{ue} \, S_{ue}^{2} \, R_{ue}^{T}
+\Sigma_{3D} = R_{ue} \thinspace S_{ue}^{2} \thinspace R_{ue}^{T}
 $$
 
 然后再通过投影 Jacobian 把它近似映射到屏幕空间，得到 2D 协方差：
 
 $$
-\Sigma_{2D} = J \, W \, \Sigma_{3D} \, W^{T} \, J^{T}
+\Sigma_{2D} = J \thinspace W \thinspace \Sigma_{3D} \thinspace W^{T} \thinspace J^{T}
 $$
 
 这里：
@@ -775,7 +775,7 @@ if alpha <= 1/255 then discard
 这里可以和原始 3DGS 的写法直接对照来看。设第 $i$ 个 splat 在当前像素处的有效透明度为
 
 $$
-\alpha_i = o_i \, w_i
+\alpha_i = o_i \thinspace w_i
 $$
 
 其中：
@@ -789,7 +789,7 @@ $$
 原始 3DGS 更常写成 front-to-back 的体渲染累积形式，也就是按深度从小到大、从近到远进行排序，并维护一个“剩余透射率” $T$ 。它的递推可以写成：
 
 $$
-C \leftarrow C + T \, \alpha_i \, c_i
+C \leftarrow C + T \thinspace \alpha_i \thinspace c_i
 $$
 
 $$
@@ -824,13 +824,47 @@ $$
 - 多个 splat 的最终图像需要按从远到近顺序逐层叠加
 - 每层都会衰减其后方已经累计的颜色贡献
 
-如果把它写成多层展开形式，那么当前 UE 这条路径等价于：
+如果沿用 8.1 中的标号约定，即 $1$ 是最近的 splat、$N$ 是最远的 splat，那么当前 UE 这条路径的绘制顺序是从 $N$ 到 $1$。为了把 UE 的 `src over dst` 公式展开，可以把已经合成到当前层之后的颜色记为 $C^{(m)}$，其中 $C^{(m)}$ 表示已经画完第 $N, N-1, \ldots, m$ 个 splat 后的结果。
+
+初始时还没有任何高斯贡献：
 
 $$
-C_{out} = \alpha_N c_N + (1-\alpha_N)\alpha_{N-1}c_{N-1} + \cdots + \left(\prod_{j=2}^{N}(1-\alpha_j)\right)\alpha_1 c_1
+C^{(N+1)} = 0
 $$
 
-这里索引若按从远到近排列，就和上面的 front-to-back 结果是一致的。
+当第 $m$ 个 splat 作为新的 `src` 叠加到已经合成好的 `dst` 上时，有：
+
+$$
+C^{(m)} = \alpha_m c_m + (1-\alpha_m) C^{(m+1)}
+$$
+
+按从远到近的绘制顺序逐层展开，前三步是：
+
+$$
+C^{(N)} = \alpha_N c_N
+$$
+
+$$
+C^{(N-1)} = \alpha_{N-1}c_{N-1} + (1-\alpha_{N-1})\alpha_N c_N
+$$
+
+$$
+C^{(N-2)} = \alpha_{N-2}c_{N-2} + (1-\alpha_{N-2})\alpha_{N-1}c_{N-1} + (1-\alpha_{N-2})(1-\alpha_{N-1})\alpha_N c_N
+$$
+
+一路展开到最近的第 $1$ 个 splat 后，最终结果为：
+
+$$
+C_{out} = \alpha_1 c_1 + (1-\alpha_1)\alpha_2 c_2 + \cdots + \left(\prod_{j=1}^{N-1}(1-\alpha_j)\right)\alpha_N c_N
+$$
+
+因此，公式里的高斯标号仍然和 8.1 一样按从近到远理解；只是 UE 的实际 draw order 要反过来执行，从最远的 $N$ 开始画，最后画最近的 $1$。当前排序 key 使用负的 view-space 深度：
+
+$$
+k_i = \mathrm{SortableUint}(-z_i)
+$$
+
+在 UE 的 GPU sort 按 key 升序输出时，越远的 splat 具有越小的 $-z_i$，因此会排在输出流前面。这样，排序后的第一个 splat 就是最远的 splat，正好满足 back-to-front over 合成所需的绘制顺序。
 
 ### 8.3 二者的关系与排序差异
 
@@ -841,7 +875,7 @@ $$
 
 因此，二者的主要差异不在最终结果，而在**排序方向**。
 
-对于原始 3DGS 的 front-to-back 累积，排序通常按深度从小到大，也就是从近到远；而在当前 UE 这条 back-to-front over 路径下，为了让 blending 的数学意义成立，排序必须改成深度从大到小，也就是从远到近。也正因为如此，这里的 GPU 排序方向与原始 3DGS 的排序方向正好相反，但两者服务的都是同一个目标：让 alpha blending 的递推顺序和它所采用的公式保持一致。
+对于原始 3DGS 的 front-to-back 累积，排序通常按深度从小到大，也就是从近到远；而在当前 UE 这条 back-to-front over 路径下，为了让 blending 的数学意义成立，绘制顺序必须改成深度从大到小，也就是从远到近。也正因为如此，当前实现用负的深度生成升序排序 key，使排序输出流的第一个可见 splat 对应最远的高斯。这里的 GPU 排序方向与原始 3DGS 的累积方向正好相反，但两者服务的都是同一个目标：让 alpha blending 的递推顺序和它所采用的公式保持一致。
 
 这也解释了为什么排序必须和 blending 公式配套。若顺序错了，不是“画面稍微有点差”，而是 alpha 累积本身的数学意义就被破坏了，最终图像会明显错误。
 

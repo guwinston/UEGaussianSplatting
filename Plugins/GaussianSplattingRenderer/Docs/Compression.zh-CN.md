@@ -358,7 +358,7 @@ $$
 若某个保留分量超过 $\sqrt{2}/2$，则至少有两个分量的平方和会超过 $1$，与单位长度约束矛盾。因此保留分量的有效范围可以限制为：
 
 $$
-r_i \in \left[-\frac{\sqrt{2}}{2},\,\frac{\sqrt{2}}{2}\right]
+r_i \in \left[-\frac{\sqrt{2}}{2},\thinspace\frac{\sqrt{2}}{2}\right]
 $$
 
 这也是代码里用 $\sqrt{2}/2$ 而不是直接用 $[-1,1]$ 量化区间的原因：它利用了 `smallest-three quaternion` 的先验约束，把同样的 `10 bit` 精度集中到更小、更合理的数值范围内。
@@ -395,7 +395,7 @@ $$
 再由单位长度约束恢复被省略分量：
 
 $$
-\hat{q}_m = sign(q_m)\sqrt{\max\left(0,\,1-\hat{r}_0^2-\hat{r}_1^2-\hat{r}_2^2\right)}
+\hat{q}_m = sign(q_m)\sqrt{\max\left(0,\thinspace1-\hat{r}_0^2-\hat{r}_1^2-\hat{r}_2^2\right)}
 $$
 
 最后再按记录的下标把四个分量放回原始顺序，得到解码后的四元数 $\hat{q}$。
