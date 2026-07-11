@@ -30,7 +30,7 @@ class GAUSSIANSPLATTING_API FGaussianObjectCullCS : public FGlobalShader
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {
-        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::ES3_1);
     }
 
     static void ModifyCompilationEnvironment(
@@ -38,7 +38,7 @@ class GAUSSIANSPLATTING_API FGaussianObjectCullCS : public FGlobalShader
         FShaderCompilerEnvironment& OutEnvironment)
     {
         FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-        OutEnvironment.SetDefine(TEXT("THREAD_GROUP_SIZE"), 256);
+        OutEnvironment.SetDefine(TEXT("THREAD_GROUP_SIZE"), 64);
     }
 };
 
@@ -77,7 +77,7 @@ class GAUSSIANSPLATTING_API FGaussianBuildSortKeysCS : public FGlobalShader
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {
-        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::ES3_1);
     }
 
     static void ModifyCompilationEnvironment(
@@ -85,7 +85,7 @@ class GAUSSIANSPLATTING_API FGaussianBuildSortKeysCS : public FGlobalShader
         FShaderCompilerEnvironment& OutEnvironment)
     {
         FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-        OutEnvironment.SetDefine(TEXT("THREAD_GROUP_SIZE"), 256);
+        OutEnvironment.SetDefine(TEXT("THREAD_GROUP_SIZE"), 64);
     }
 };
 
@@ -105,7 +105,7 @@ class GAUSSIANSPLATTING_API FGaussianBuildIndirectArgsCS : public FGlobalShader
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {
-        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::ES3_1);
     }
 
     static void ModifyCompilationEnvironment(
@@ -216,6 +216,7 @@ class GAUSSIANSPLATTING_API FGaussianSplatVS : public FGlobalShader
         SHADER_PARAMETER(int32, TotalSplatCount)
         SHADER_PARAMETER(int32, ObjectCount)
         SHADER_PARAMETER(uint32, EnableAntialiasing)
+        SHADER_PARAMETER(uint32, EnableOpacityAwareBounds)
         SHADER_PARAMETER(float, PreExposure)
         SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
     END_SHADER_PARAMETER_STRUCT()
@@ -224,6 +225,9 @@ class GAUSSIANSPLATTING_API FGaussianSplatVS : public FGlobalShader
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {
+        // This desktop VS reads several buffer SRVs. Android Mobile Vulkan
+        // explicitly disables vertex-shader SRVs, so its replacement backend
+        // must use a compute-generated instance stream instead.
         return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
     }
 
@@ -261,7 +265,7 @@ class GAUSSIANSPLATTING_API FGaussianSplatPS : public FGlobalShader
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {
-        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::ES3_1);
     }
 
     static void ModifyCompilationEnvironment(
@@ -285,7 +289,7 @@ class GAUSSIANSPLATTING_API FGaussianSplatCompositeVS : public FGlobalShader
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {
-        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::ES3_1);
     }
 };
 
@@ -305,7 +309,7 @@ class GAUSSIANSPLATTING_API FGaussianSplatCompositePS : public FGlobalShader
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {
-        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::ES3_1);
     }
 };
 

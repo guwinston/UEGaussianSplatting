@@ -58,3 +58,4 @@ UEGaussianSplatting.uproject          Unreal 项目文件
 - [渲染原理](Plugins/GaussianSplattingRenderer/Docs/RenderingPrinciples.zh-CN.md)
 - [GPU 排序](Plugins/GaussianSplattingRenderer/Docs/GPUSorting.zh-CN.md)
 - [模型压缩](Plugins/GaussianSplattingRenderer/Docs/Compression.zh-CN.md)
+- [移动端支持](Plugins/GaussianSplattingRenderer/Docs/Mobile.zh-CN.md)

@@ -57,3 +57,4 @@ For detailed plugin usage, rendering principles, GPU sorting, and compression no
 - [Rendering Principles](Plugins/GaussianSplattingRenderer/Docs/RenderingPrinciples.md)
 - [GPU Sorting](Plugins/GaussianSplattingRenderer/Docs/GPUSorting.md)
 - [Compression](Plugins/GaussianSplattingRenderer/Docs/Compression.md)
+- [Mobile Platform Support](Plugins/GaussianSplattingRenderer/Docs/Mobile.md)

@@ -428,6 +428,20 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
 {
     RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussianSplat, "GaussianSplat");
     RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplat);
+    // Compute UAVs, GPU radix sorting and indirect drawing require SM5. Guard
+    // before shader lookup so an ES3.1 fallback device safely keeps SceneColor.
+    if (InView.GetFeatureLevel() < ERHIFeatureLevel::SM5)
+    {
+        static bool bLoggedUnsupportedFeatureLevel = false;
+        if (!bLoggedUnsupportedFeatureLevel)
+        {
+            bLoggedUnsupportedFeatureLevel = true;
+            UE_LOG(LogTemp, Warning,
+                TEXT("GaussianSplatting: the current raster backend requires SM5; the Mobile Vulkan instance-stream backend is not active yet."));
+        }
+        return;
+    }
+
     // 0. Gather proxies — snapshot for this frame; do NOT clear RegisteredProxies.
     // RegisteredProxies is a persistent set managed by RegisterProxy/UnregisterProxy.
     // Clearing it here would cause the static cache to be invalidated every frame
@@ -438,6 +452,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     // 1. CVars + shaders
     const int32 RasterMode = GaussianSplatCVars::GetRasterModeOnRenderThread();
     const uint32 bEnableAntialiasing = GaussianSplatCVars::GetEnableAntialiasingOnRenderThread() != 0 ? 1u : 0u;
+    const uint32 bEnableOpacityAwareBounds = GaussianSplatCVars::GetOpacityAwareBoundsOnRenderThread() != 0 ? 1u : 0u;
     FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
     if (!ShaderMap) return;
 
@@ -575,7 +590,14 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         const float TanHalfFovY = (FMath::Abs((float)ProjMatrix.M[1][1]) > 1e-6f)
             ? 1.0f / (float)ProjMatrix.M[1][1] : 1.0f;
 
-        GlobalSorter->RequestSort(WorldToView, ViewToClip, TanHalfFovX, TanHalfFovY, TotalSplats, /*bLazy=*/!bRebuiltStaticBuffers);
+        const bool bForceSortEveryFrame = GaussianSplatCVars::GetForceSortEveryFrameOnAnyThread() != 0;
+        GlobalSorter->RequestSort(
+            WorldToView,
+            ViewToClip,
+            TanHalfFovX,
+            TanHalfFovY,
+            TotalSplats,
+            /*bLazy=*/!bRebuiltStaticBuffers && !bForceSortEveryFrame);
     }
 
     // 6. Prepare per-frame draw resources.
@@ -752,6 +774,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         PassParams->VS.TotalSplatCount  = TotalSplats;
         PassParams->VS.ObjectCount      = NumObjects;
         PassParams->VS.EnableAntialiasing = bEnableAntialiasing;
+        PassParams->VS.EnableOpacityAwareBounds = bEnableOpacityAwareBounds;
         PassParams->VS.PreExposure      = CompositePreExposure;
         PassParams->PS.WorldToView = WorldToView;
         PassParams->PS.FocalLength = FVector2f(FX, FY);
@@ -826,9 +849,11 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
 
     if (bCompositeToUELinear)
     {
-        RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussianSplatAccumulate, "GaussianSplat_Accumulate");
-        RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplatAccumulate);
-        AddMainSplatPass(TEXT("GaussianSplat_Accumulate"));
+        {
+            RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussianSplatAccumulate, "GaussianSplat_Accumulate");
+            RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplatAccumulate);
+            AddMainSplatPass(TEXT("GaussianSplat_Accumulate"));
+        }
 
         // 8. Composite the fully accumulated 3DGS image into UE SceneColor.
         FGaussianSplatCompositePassParameters* CompositeParams = GraphBuilder.AllocParameters<FGaussianSplatCompositePassParameters>();
@@ -844,15 +869,16 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
             }
         }
 
-        RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussianSplatComposite, "GaussianSplat_Composite");
-        RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplatComposite);
-        GraphBuilder.AddPass(
-            RDG_EVENT_NAME("GaussianSplat_Composite"),
-            CompositeParams,
-            ERDGPassFlags::Raster,
-            [CompositeVertexShader, CompositePixelShader, CompositeParams, VMinX, VMinY, VMaxX, VMaxY]
-            (FRHICommandList& RHICmdList)
-            {
+        {
+            RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussianSplatComposite, "GaussianSplat_Composite");
+            RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplatComposite);
+            GraphBuilder.AddPass(
+                RDG_EVENT_NAME("GaussianSplat_Composite"),
+                CompositeParams,
+                ERDGPassFlags::Raster,
+                [CompositeVertexShader, CompositePixelShader, CompositeParams, VMinX, VMinY, VMaxX, VMaxY]
+                (FRHICommandList& RHICmdList)
+                {
                 FGraphicsPipelineStateInitializer PSOInit;
                 RHICmdList.ApplyCachedRenderTargets(PSOInit);
 
@@ -876,16 +902,19 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
                 SetShaderParameters(RHICmdList, CompositePixelShader, CompositePixelShader.GetPixelShader(), CompositeParams->PS);
                 // Draw one oversized fullscreen triangle; the VS expands 3 vertices
                 // to cover the whole viewport, so a second triangle is unnecessary.
-                RHICmdList.DrawPrimitive(0, 1, 1);
-            }
-        );
+                    RHICmdList.DrawPrimitive(0, 1, 1);
+                }
+            );
+        }
     }
     else
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_SetupDirectPass_CPU);
-        RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussianSplatDirect, "GaussianSplat_DirectAfterTonemap");
-        RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplatDirect);
-        AddMainSplatPass(TEXT("GaussianSplat_DirectAfterTonemap"));
+        {
+            RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussianSplatDirect, "GaussianSplat_DirectAfterTonemap");
+            RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplatDirect);
+            AddMainSplatPass(TEXT("GaussianSplat_DirectAfterTonemap"));
+        }
     }
 }
 

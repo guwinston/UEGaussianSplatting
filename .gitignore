@@ -3,10 +3,17 @@ Binaries/
 DerivedDataCache/
 Intermediate/
 Saved/
+Packaged/
+
+# Android packaging output generated under the otherwise source-controlled Build tree
+Build/Android/FileOpenOrder/
+Build/Android/src/
 
 # IDE / local workspace files
 .vs/
 .vscode/
+.agents/
+.codex/
 Tools/
 *.sln
 *.suo
@@ -20,6 +27,9 @@ Tools/
 *.log
 *.tmp
 *.cache
+*.apk
+*.aab
+*.obb
 
 # User-local Unreal content
 Content/Developers/

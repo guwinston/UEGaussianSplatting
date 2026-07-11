@@ -120,6 +120,7 @@ uint      UseManualSceneDepthTest;
 int       TotalSplatCount;  // total splats across all objects
 int       ObjectCount;
 uint      EnableAntialiasing;
+uint      EnableOpacityAwareBounds;
 float     PreExposure;      // View.PreExposure: multiplier to match SceneColor HDR range
 static const uint GS_CHUNK_SIZE = 256u;
 // ============================================================
@@ -538,7 +539,15 @@ FVSOutput GaussianSplatVS(uint VertexID : SV_VertexID)
     // bv1/bv2 are the two screen-space ellipse axes with length already baked in.
     float2 bv1, bv2;
     float  opacity = splatColor.a;
-    if (!ComputeProjectedExtentBasis(cov2D, SQRT8, obj.SplatScale, opacity, bv1, bv2)) {
+    float gaussianExtent = SQRT8;
+    if (EnableOpacityAwareBounds != 0u)
+    {
+        // Solve opacity * exp(-0.5 * r^2) == 1/255 for the useful support radius.
+        // Capping at SQRT8 makes this option shrink-only relative to the old path.
+        const float alphaThreshold = 1.0f / 255.0f;
+        gaussianExtent = min(SQRT8, sqrt(max(0.0f, 2.0f * log(max(opacity, alphaThreshold) / alphaThreshold))));
+    }
+    if (!ComputeProjectedExtentBasis(cov2D, gaussianExtent, obj.SplatScale, opacity, bv1, bv2)) {
         return Out;
     }
     splatColor.a = opacity;
@@ -565,7 +574,7 @@ FVSOutput GaussianSplatVS(uint VertexID : SV_VertexID)
     Out.SplatColor   = splatColor;
     // Use sqrt(8) sigma as the local-space ellipse extent here (the original 3DGS uses 3 sigma).
     // In this normalized Gaussian local space, the standard deviation is 1 on each axis.
-    Out.FragPos      = corner * SQRT8;
+    Out.FragPos      = corner * gaussianExtent;
     Out.ScreenCenter = screenCenter;
     Out.Conic        = conic;
     Out.CenterViewPos = vCenter.xyz;

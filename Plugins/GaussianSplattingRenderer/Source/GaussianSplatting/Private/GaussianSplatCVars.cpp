@@ -58,6 +58,22 @@ static TAutoConsoleVariable<float> CVarGaussianSplatFrustumSlack(
     TEXT("1.0 = exact mathematical frustum. Recommended range: 1.05 - 1.5."),
     ECVF_RenderThreadSafe);
 
+static TAutoConsoleVariable<int32> CVarGaussianSplatOpacityAwareBounds(
+    TEXT("r.GaussianSplat.OpacityAwareBounds"),
+    1,
+    TEXT("Shrink the rasterized ellipse bounds using opacity and the 1/255 pixel cutoff.\n")
+    TEXT(" 0 = fixed sqrt(8)-sigma bounds\n")
+    TEXT(" 1 = opacity-aware bounds, capped at the existing sqrt(8)-sigma extent"),
+    ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarGaussianSplatForceSortEveryFrame(
+    TEXT("r.GaussianSplat.ForceSortEveryFrame"),
+    0,
+    TEXT("Force the GPU cull and sort pipeline to run every frame for profiling.\n")
+    TEXT(" 0 = reuse the previous sort while the view is unchanged\n")
+    TEXT(" 1 = run cull, key generation, sort and indirect-args generation every frame"),
+    ECVF_RenderThreadSafe);
+
 namespace GaussianSplatCVars
 {
     int32 GetRenderModeOnRenderThread()
@@ -85,9 +101,19 @@ namespace GaussianSplatCVars
         return CVarGaussianSplatEnableAntialiasing.GetValueOnRenderThread() != 0 ? 1 : 0;
     }
 
+    int32 GetOpacityAwareBoundsOnRenderThread()
+    {
+        return CVarGaussianSplatOpacityAwareBounds.GetValueOnRenderThread() != 0 ? 1 : 0;
+    }
+
     int32 GetCullModeOnAnyThread()
     {
         return FMath::Clamp(CVarGaussianSplatCullMode.GetValueOnAnyThread(), 0, 2);
+    }
+
+    int32 GetForceSortEveryFrameOnAnyThread()
+    {
+        return CVarGaussianSplatForceSortEveryFrame.GetValueOnAnyThread() != 0 ? 1 : 0;
     }
 
     float GetSplatFrustumSlackOnAnyThread()

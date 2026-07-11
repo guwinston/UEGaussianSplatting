@@ -9,7 +9,9 @@ namespace GaussianSplatCVars
     int32 GetEnableHigherOrderSHOnRenderThread();
     int32 GetUseNoAAProjectionOnRenderThread();
     int32 GetEnableAntialiasingOnRenderThread();
+    int32 GetOpacityAwareBoundsOnRenderThread();
 
     int32 GetCullModeOnAnyThread();
+    int32 GetForceSortEveryFrameOnAnyThread();
     float GetSplatFrustumSlackOnAnyThread();
 }

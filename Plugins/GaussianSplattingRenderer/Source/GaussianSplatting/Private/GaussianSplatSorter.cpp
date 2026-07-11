@@ -9,12 +9,14 @@
 #include "RenderGraphUtils.h"
 #include "ShaderParameterUtils.h"
 
+DECLARE_GPU_STAT_NAMED(GaussianSplatObjectCull, TEXT("Gaussian Splat Object Cull"));
 DECLARE_GPU_STAT_NAMED(GaussianSplatSortKeyGen, TEXT("Gaussian Splat Sort Key Gen"));
 DECLARE_GPU_STAT_NAMED(GaussianSplatGPUSort, TEXT("Gaussian Splat GPU Sort"));
+DECLARE_GPU_STAT_NAMED(GaussianSplatIndirectArgs, TEXT("Gaussian Splat Indirect Args"));
 
 namespace
 {
-static constexpr int32 GGaussianSplatBuildSortKeysGroupSize = 256;
+static constexpr int32 GGaussianSplatBuildSortKeysGroupSize = 64;
 
 static int32 GetMaxDispatchGroupsX()
 {
@@ -419,6 +421,8 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
     //    frustum test. Per-splat cull later reuses this buffer as a coarse early-out.
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_ObjectCullCS_RT);
+        SCOPED_GPU_STAT(RHICmdList, GaussianSplatObjectCull);
+        SCOPED_DRAW_EVENTF(RHICmdList, GaussianSplatObjectCull, TEXT("GaussianSplat_ObjectCull(%d)"), ObjectCount);
         TShaderMapRef<FGaussianObjectCullCS> ComputeShader(ShaderMap);
         FGaussianObjectCullCS::FParameters Parameters;
         Parameters.PerObjectBuffer = PerObjectSRV;
@@ -433,7 +437,7 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
             RHICmdList,
             ComputeShader,
             Parameters,
-            FIntVector(FMath::DivideAndRoundUp(ObjectCount, 256), 1, 1));
+            FIntVector(FMath::DivideAndRoundUp(ObjectCount, 64), 1, 1));
         RHICmdList.Transition(FRHITransitionInfo(ObjectVisibilityUAV, ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
     }
 
@@ -527,6 +531,8 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
     //    only the visible prefix of the sorted global splat permutation.
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_BuildIndirectArgsCS_RT);
+        SCOPED_GPU_STAT(RHICmdList, GaussianSplatIndirectArgs);
+        SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatIndirectArgs);
         TShaderMapRef<FGaussianBuildIndirectArgsCS> ComputeShader(ShaderMap);
         FGaussianBuildIndirectArgsCS::FParameters Parameters;
         Parameters.VisibleCountBuffer = VisibleCountSRV;
