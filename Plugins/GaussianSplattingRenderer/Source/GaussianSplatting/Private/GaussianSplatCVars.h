@@ -19,8 +19,10 @@ namespace GaussianSplatCVars
     int32 GetScreenSizeCullOnAnyThread();
     float GetScreenSizeCullMinPixelsOnAnyThread();
 
-    /** GPU sort method: 0 = UE built-in, 1 = DeviceRadix8. */
+    /** GPU sort/render method: 0 = UE built-in, 1 = DeviceRadix8, 2 = stochastic no-sort. */
     int32 GetSortMethodOnRenderThread();
+    /** Number of stochastic frames to accumulate. 0 disables temporal accumulation. */
+    int32 GetStochasticTemporalSamplesOnRenderThread();
     int32 GetDeviceRadixPassCountOnRenderThread();
     int32 GetDeviceRadixWriteFinalKeysOnRenderThread();
 }

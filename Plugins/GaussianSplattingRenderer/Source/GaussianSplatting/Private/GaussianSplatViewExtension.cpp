@@ -17,6 +17,7 @@
 #include "PostProcess/PostProcessMaterialInputs.h"
 #include "ScreenPass.h"                      // FScreenPassTexture
 #include "SceneRendering.h"                  // FViewInfo (for PreExposure access)
+#include "RenderTargetPool.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "Misc/EngineVersionComparison.h"
 
@@ -104,6 +105,7 @@ FGaussianSplatViewExtension::~FGaussianSplatViewExtension()
         GlobalSorter->Shutdown();
         GlobalSorter.Reset();
     }
+    StochasticTemporalHistories.Empty();
 }
 
 // ============================================================
@@ -122,6 +124,7 @@ void FGaussianSplatViewExtension::UnregisterProxy(const FGaussianSplatSceneProxy
 
     // Invalidate static cache so it rebuilds next frame without this proxy.
     CachedProxySet.Empty();
+    StochasticTemporalHistories.Empty();
 }
 
 // ============================================================
@@ -450,6 +453,12 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
 
     // 1. CVars + shaders
     const int32 RasterMode = GaussianSplatCVars::GetRasterModeOnRenderThread();
+    const int32 SortMethod = GaussianSplatCVars::GetSortMethodOnRenderThread();
+    const bool bUseStochasticSplat = SortMethod == 2;
+    if (!bUseStochasticSplat && !StochasticTemporalHistories.IsEmpty())
+    {
+        StochasticTemporalHistories.Empty();
+    }
     const uint32 bEnableAntialiasing = GaussianSplatCVars::GetEnableAntialiasingOnRenderThread() != 0 ? 1u : 0u;
     const uint32 bEnableOpacityAwareBounds = GaussianSplatCVars::GetOpacityAwareBoundsOnRenderThread() != 0 ? 1u : 0u;
     FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
@@ -464,11 +473,15 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     TShaderMapRef<FGaussianSplatPS> PixelShader(ShaderMap, FGaussianSplatPS::FPermutationDomain{});
     TShaderMapRef<FGaussianSplatCompositeVS> CompositeVertexShader(ShaderMap);
     TShaderMapRef<FGaussianSplatCompositePS> CompositePixelShader(ShaderMap);
+    TShaderMapRef<FGaussianSplatTemporalPS> TemporalPixelShader(ShaderMap);
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_SetupShaders_CPU);
         VsPerm.Set<FGaussianSplatRasterModeDim>(RasterMode);
         MsPerm.Set<FGaussianSplatRasterModeDim>(RasterMode);
         PsPerm.Set<FGaussianSplatRasterModeDim>(RasterMode);
+        VsPerm.Set<FGaussianSplatStochasticDim>(bUseStochasticSplat);
+        MsPerm.Set<FGaussianSplatStochasticDim>(bUseStochasticSplat);
+        PsPerm.Set<FGaussianSplatStochasticDim>(bUseStochasticSplat);
 
         VertexShader = TShaderMapRef<FGaussianSplatVS>(ShaderMap, VsPerm);
         if (GRHISupportsMeshShadersTier0)
@@ -480,7 +493,8 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         CompositePixelShader = TShaderMapRef<FGaussianSplatCompositePS>(ShaderMap);
     }
     if (!VertexShader.IsValid() || !PixelShader.IsValid()
-        || !CompositeVertexShader.IsValid() || !CompositePixelShader.IsValid())
+        || !CompositeVertexShader.IsValid() || !CompositePixelShader.IsValid()
+        || (bUseStochasticSplat && !TemporalPixelShader.IsValid()))
     {
         return;
     }
@@ -587,6 +601,63 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         }
     }
 
+    // Prepare per-view stochastic history before sort/draw resources are queued.
+    const int32 StochasticTemporalSampleLimit = bUseStochasticSplat
+        ? GaussianSplatCVars::GetStochasticTemporalSamplesOnRenderThread() : 0;
+    TSharedPtr<FStochasticTemporalHistory> TemporalHistory;
+    uint32 StochasticSampleIndex = InView.Family
+        ? static_cast<uint32>(InView.Family->FrameNumber) : 0u;
+    if (StochasticTemporalSampleLimit > 0)
+    {
+        const void* HistoryKey = InView.State
+            ? static_cast<const void*>(InView.State)
+            : static_cast<const void*>(InView.Family);
+        if (HistoryKey)
+        {
+            TSharedPtr<FStochasticTemporalHistory>& HistorySlot = StochasticTemporalHistories.FindOrAdd(HistoryKey);
+            if (!HistorySlot.IsValid())
+            {
+                HistorySlot = MakeShared<FStochasticTemporalHistory>();
+            }
+            TemporalHistory = HistorySlot;
+
+            const FMatrix44f HistoryViewMatrix(ViewMatrix);
+            const FMatrix44f HistoryProjectionMatrix(InView.ViewMatrices.ComputeProjectionNoAAMatrix());
+            uint32 HistorySignature = FCrc::MemCrc32(&HistoryViewMatrix, sizeof(HistoryViewMatrix));
+            HistorySignature = FCrc::MemCrc32(&HistoryProjectionMatrix, sizeof(HistoryProjectionMatrix), HistorySignature);
+            HistorySignature = FCrc::MemCrc32(
+                ObjectDescs.GetData(), ObjectDescs.Num() * sizeof(FGaussianSplatObjectGPUDesc), HistorySignature);
+            for (const FGaussianSplatSceneProxy* Proxy : ValidProxies)
+            {
+                HistorySignature = HashCombine(HistorySignature, GetTypeHash(reinterpret_cast<UPTRINT>(Proxy)));
+            }
+            HistorySignature = HashCombine(HistorySignature, GetTypeHash(RasterMode));
+            HistorySignature = HashCombine(HistorySignature, GetTypeHash(GeometryMode));
+            HistorySignature = HashCombine(HistorySignature, GetTypeHash(bEnableAntialiasing));
+            HistorySignature = HashCombine(HistorySignature, GetTypeHash(bEnableOpacityAwareBounds));
+            HistorySignature = HashCombine(HistorySignature, GetTypeHash(StochasticTemporalSampleLimit));
+            HistorySignature = HashCombine(HistorySignature, GetTypeHash(GaussianSplatCVars::GetCullModeOnAnyThread()));
+            HistorySignature = HashCombine(HistorySignature, GetTypeHash(GaussianSplatCVars::GetSplatFrustumSlackOnAnyThread()));
+            HistorySignature = HashCombine(HistorySignature, GetTypeHash(GaussianSplatCVars::GetScreenSizeCullOnAnyThread()));
+            HistorySignature = HashCombine(HistorySignature, GetTypeHash(GaussianSplatCVars::GetScreenSizeCullMinPixelsOnAnyThread()));
+            HistorySignature = HashCombine(HistorySignature, GetTypeHash(bCompositeToUELinear));
+
+            const bool bResetHistory = bRebuiltStaticBuffers
+                || TemporalHistory->Signature != HistorySignature
+                || TemporalHistory->Extent != SceneColorTexture->Desc.Extent
+                || TemporalHistory->ViewRect != ViewRect;
+            if (bResetHistory)
+            {
+                TemporalHistory->Texture.SafeRelease();
+                TemporalHistory->SampleCount = 0;
+                TemporalHistory->Signature = HistorySignature;
+                TemporalHistory->Extent = SceneColorTexture->Desc.Extent;
+                TemporalHistory->ViewRect = ViewRect;
+            }
+            StochasticSampleIndex = TemporalHistory->SampleCount;
+        }
+    }
+
     // 5. Queue the merged GPU sort request for this frame.
     if (GlobalSorter.IsValid())
     {
@@ -629,6 +700,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     FRDGBufferSRVRef ChunkPositionMaxSRV;
     FRDGBufferSRVRef ObjectIndexSRV;
     FRDGTextureRef GaussianAccumTexture = nullptr;
+    const bool bRenderToAccumTexture = bCompositeToUELinear || bUseStochasticSplat;
     FRDGBufferRef DrawIndirectArgsBuffer = nullptr;
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_UploadDynamicBuffers_CPU);
@@ -732,33 +804,52 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         }
 
         // 6.4 Create the accumulation target used by the pre-tonemap composite path.
-        if (bCompositeToUELinear)
+        if (bRenderToAccumTexture)
         {
             FRDGTextureDesc GaussianAccumDesc = FRDGTextureDesc::Create2D(
                 SceneColorTexture->Desc.Extent,
                 PF_FloatRGBA,
                 FClearValueBinding(FLinearColor::Transparent),
                 TexCreate_ShaderResource | TexCreate_RenderTargetable);
-            GaussianAccumTexture = GraphBuilder.CreateTexture(GaussianAccumDesc, TEXT("GS_AccumulatedColor"));
+            GaussianAccumTexture = GraphBuilder.CreateTexture(GaussianAccumDesc, TEXT("GS_CurrentSampleColor"));
             AddClearRenderTargetPass(GraphBuilder, GaussianAccumTexture, FLinearColor::Transparent, ViewRect);
         }
+    }
+
+    FRDGTextureRef GaussianStochasticDepthTexture = nullptr;
+    if (bUseStochasticSplat)
+    {
+        const FRDGTextureDesc StochasticDepthDesc = FRDGTextureDesc::Create2D(
+            SceneColorTexture->Desc.Extent,
+            PF_DepthStencil,
+            FClearValueBinding::DepthFar,
+            TexCreate_DepthStencilTargetable | TexCreate_ShaderResource);
+        GaussianStochasticDepthTexture = GraphBuilder.CreateTexture(StochasticDepthDesc, TEXT("GS_StochasticDepth"));
     }
     if (!SortedIndexSRV || !VisibleCountSRV || !DrawIndirectArgsBuffer) return;
 
 
     const FViewInfo* ViewInfo = InView.bIsViewInfo ? &static_cast<const FViewInfo&>(InView) : nullptr;
     const FIntRect SceneDepthViewRect = ViewInfo ? ViewInfo->ViewRect : ViewRect;
-    const bool bUseManualSceneDepthTest = SceneDepthTexture != nullptr && ViewInfo
-        && SceneDepthViewRect != ViewRect;
+    const bool bUseManualSceneDepthTest = SceneDepthTexture != nullptr
+        && (bUseStochasticSplat || (ViewInfo && SceneDepthViewRect != ViewRect));
 
     // 7. Build accumulation pass parameters and issue the merged splat draw call.
     FGaussianSplatPassParameters* PassParams = GraphBuilder.AllocParameters<FGaussianSplatPassParameters>();
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_SetupAccumulatePass_CPU);
         PassParams->RenderTargets[0] = FRenderTargetBinding(
-            bCompositeToUELinear ? GaussianAccumTexture : SceneColorTexture,
-            bCompositeToUELinear ? ERenderTargetLoadAction::EClear : ERenderTargetLoadAction::ELoad);
-        if (SceneDepthTexture && !bUseManualSceneDepthTest)
+            bRenderToAccumTexture ? GaussianAccumTexture : SceneColorTexture,
+            bRenderToAccumTexture ? ERenderTargetLoadAction::EClear : ERenderTargetLoadAction::ELoad);
+        if (bUseStochasticSplat)
+        {
+            PassParams->RenderTargets.DepthStencil = FDepthStencilBinding(
+                GaussianStochasticDepthTexture,
+                ERenderTargetLoadAction::EClear,
+                ERenderTargetLoadAction::ENoAction,
+                FExclusiveDepthStencil::DepthWrite_StencilNop);
+        }
+        else if (SceneDepthTexture && !bUseManualSceneDepthTest)
         {
             // Read the existing scene depth but do not write 3DGS depth back.
             // This lets 3DGS be occluded by already-rendered UE geometry without
@@ -807,6 +898,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
             ? FVector2f(1.0f / (float)SceneDepthTexture->Desc.Extent.X, 1.0f / (float)SceneDepthTexture->Desc.Extent.Y)
             : FVector2f::ZeroVector;
         PassParams->PS.UseManualSceneDepthTest = bUseManualSceneDepthTest ? 1u : 0u;
+        PassParams->PS.StochasticFrameIndex = StochasticSampleIndex;
         if (ViewInfo)
         {
             PassParams->VS.View = ViewInfo->ViewUniformBuffer;
@@ -821,7 +913,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
             RDG_EVENT_NAME("%s_%s", PassName, GeometryBackendName),
             PassParams,
             ERDGPassFlags::Raster,
-            [VertexShader, MeshShader, PixelShader, PassParams, VMinX, VMinY, VMaxX, VMaxY, bCompositeToUELinear, bUseManualSceneDepthTest, bUseMeshShader, bHasSceneDepth = (SceneDepthTexture != nullptr)]
+            [VertexShader, MeshShader, PixelShader, PassParams, VMinX, VMinY, VMaxX, VMaxY, bCompositeToUELinear, bUseManualSceneDepthTest, bUseMeshShader, bUseStochasticSplat, bHasSceneDepth = (SceneDepthTexture != nullptr)]
             (FRHICommandList& RHICmdList)
             {
                 FGraphicsPipelineStateInitializer PSOInit;
@@ -831,10 +923,12 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
                 // post-tonemap path with screen percentage < 100%, SceneColor may already
                 // be upscaled while scene depth is still primary-resolution, which clips
                 // rasterization to the smaller overlap region.
-                PSOInit.DepthStencilState = (bHasSceneDepth && !bUseManualSceneDepthTest)
+                PSOInit.DepthStencilState = bUseStochasticSplat
+                    ? TStaticDepthStencilState<true, CF_DepthNearOrEqual>::GetRHI()
+                    : (bHasSceneDepth && !bUseManualSceneDepthTest)
                     ? TStaticDepthStencilState<false, CF_DepthNearOrEqual>::GetRHI()
                     : TStaticDepthStencilState<false, CF_Always>::GetRHI();
-                if (bCompositeToUELinear)
+                if (bCompositeToUELinear || bUseStochasticSplat)
                 {
                     PSOInit.BlendState = TStaticBlendState<
                         CW_RGBA,
@@ -890,7 +984,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         );
     };
 
-    if (bCompositeToUELinear)
+    if (bRenderToAccumTexture)
     {
         {
             RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussianSplatAccumulate, "GaussianSplat_Accumulate");
@@ -902,6 +996,71 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         FGaussianSplatCompositePassParameters* CompositeParams = GraphBuilder.AllocParameters<FGaussianSplatCompositePassParameters>();
         {
             TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_SetupCompositePass_CPU);
+            if (bUseStochasticSplat && TemporalHistory.IsValid())
+            {
+                const bool bHistoryValid = TemporalHistory->Texture.IsValid()
+                    && TemporalHistory->SampleCount > 0;
+                const bool bHistoryConverged = bHistoryValid
+                    && TemporalHistory->SampleCount >= static_cast<uint32>(StochasticTemporalSampleLimit);
+
+                if (bHistoryConverged)
+                {
+                    GaussianAccumTexture = GraphBuilder.RegisterExternalTexture(
+                        TemporalHistory->Texture, TEXT("GS_StochasticHistoryConverged"));
+                }
+                else
+                {
+                    FRDGTextureRef HistoryInput = bHistoryValid
+                        ? GraphBuilder.RegisterExternalTexture(TemporalHistory->Texture, TEXT("GS_StochasticHistoryInput"))
+                        : GSystemTextures.GetBlackDummy(GraphBuilder);
+                    FRDGTextureDesc HistoryDesc = FRDGTextureDesc::Create2D(
+                        SceneColorTexture->Desc.Extent,
+                        PF_FloatRGBA,
+                        FClearValueBinding(FLinearColor::Transparent),
+                        TexCreate_ShaderResource | TexCreate_RenderTargetable);
+                    FRDGTextureRef HistoryOutput = GraphBuilder.CreateTexture(HistoryDesc, TEXT("GS_StochasticHistoryOutput"));
+
+                    FGaussianSplatTemporalPassParameters* TemporalParams =
+                        GraphBuilder.AllocParameters<FGaussianSplatTemporalPassParameters>();
+                    TemporalParams->RenderTargets[0] = FRenderTargetBinding(
+                        HistoryOutput, ERenderTargetLoadAction::EClear);
+                    TemporalParams->PS.CurrentSampleTexture = GaussianAccumTexture;
+                    TemporalParams->PS.HistoryTexture = HistoryInput;
+                    TemporalParams->PS.CurrentSampleWeight = 1.0f
+                        / static_cast<float>(TemporalHistory->SampleCount + 1u);
+
+                    GraphBuilder.AddPass(
+                        RDG_EVENT_NAME("GaussianSplat_StochasticTemporal_%u", TemporalHistory->SampleCount + 1u),
+                        TemporalParams,
+                        ERDGPassFlags::Raster,
+                        [CompositeVertexShader, TemporalPixelShader, TemporalParams, VMinX, VMinY, VMaxX, VMaxY]
+                        (FRHICommandList& RHICmdList)
+                        {
+                            FGraphicsPipelineStateInitializer PSOInit;
+                            RHICmdList.ApplyCachedRenderTargets(PSOInit);
+                            PSOInit.DepthStencilState = TStaticDepthStencilState<false, CF_Always>::GetRHI();
+                            PSOInit.BlendState = TStaticBlendState<>::GetRHI();
+                            PSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+                            PSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+                            PSOInit.BoundShaderState.VertexShaderRHI = CompositeVertexShader.GetVertexShader();
+                            PSOInit.BoundShaderState.PixelShaderRHI = TemporalPixelShader.GetPixelShader();
+                            PSOInit.PrimitiveType = PT_TriangleList;
+                            SetGraphicsPipelineState(RHICmdList, PSOInit, 0);
+                            RHICmdList.SetViewport(VMinX, VMinY, 0.0f, VMaxX, VMaxY, 1.0f);
+                            SetShaderParameters(
+                                RHICmdList, TemporalPixelShader, TemporalPixelShader.GetPixelShader(), TemporalParams->PS);
+                            RHICmdList.DrawPrimitive(0, 1, 1);
+                        });
+
+                    GaussianAccumTexture = HistoryOutput;
+                    TemporalHistory->Texture.SafeRelease();
+                    GraphBuilder.QueueTextureExtraction(HistoryOutput, &TemporalHistory->Texture);
+                    TemporalHistory->SampleCount = FMath::Min<uint32>(
+                        TemporalHistory->SampleCount + 1u,
+                        static_cast<uint32>(StochasticTemporalSampleLimit));
+                }
+            }
+
             CompositeParams->RenderTargets[0] = FRenderTargetBinding(SceneColorTexture, ERenderTargetLoadAction::ELoad);
             CompositeParams->PS.GaussianAccumTexture = GaussianAccumTexture;
             CompositeParams->PS.PreExposure = CompositePreExposure;

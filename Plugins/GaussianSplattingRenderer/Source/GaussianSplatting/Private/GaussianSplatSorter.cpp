@@ -461,7 +461,9 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
         return false;
     }
 
-    bool bUseDeviceRadixSort = GaussianSplatCVars::GetSortMethodOnRenderThread() == 1;
+    const int32 SortMethod = GaussianSplatCVars::GetSortMethodOnRenderThread();
+    bool bUseDeviceRadixSort = SortMethod == 1;
+    const bool bUseStochasticSplat = SortMethod == 2;
     if (bUseDeviceRadixSort && !DeviceRadixSort::IsSupported())
     {
         UE_LOG(LogTemp, Warning,
@@ -496,6 +498,7 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
     // 2. Per-splat cull + depth-key generation.
     //    DeviceRadix compacts visible key/value pairs into [0, VisibleCount), while the UE
     //    built-in fallback retains the full key stream and moves culled splats to the tail.
+    //    Stochastic rendering compacts visible IDs directly into the final index buffer.
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_BuildSortKeysCS_RT);
         RHI_BREADCRUMB_EVENT_STAT(RHICmdList, GaussianSplatSortKeyGen, "GaussianSplat_SortKeyGen");
@@ -519,14 +522,21 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
         Parameters.ScreenSizeCullMinPixels = GaussianSplatCVars::GetScreenSizeCullMinPixelsOnAnyThread();
         Parameters.MaxFocalLengthPixels = RequestedMaxFocalLengthPixels;
         Parameters.WorldToView = RequestedWorldToView;
-        Parameters.CompactVisibleOutput = bUseDeviceRadixSort ? 1u : 0u;
+        Parameters.CompactVisibleOutput = bUseStochasticSplat ? 2u : (bUseDeviceRadixSort ? 1u : 0u);
         Parameters.OutDepthKeys = GPUSortKeyUAV[0];
-        Parameters.OutSortValues = GPUSortValueUAV[0];
+        Parameters.OutSortValues = bUseStochasticSplat ? SortedIndexUAV : GPUSortValueUAV[0];
         Parameters.OutVisibleCount = VisibleCountUAV;
 
         // VisibleCount is already in UAV state after the GPU clear above.
         RHICmdList.Transition(FRHITransitionInfo(GPUSortKeyUAV[0], ERHIAccess::Unknown, ERHIAccess::UAVCompute));
-        RHICmdList.Transition(FRHITransitionInfo(GPUSortValueUAV[0], ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+        if (!bUseStochasticSplat)
+        {
+            RHICmdList.Transition(FRHITransitionInfo(GPUSortValueUAV[0], ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+        }
+        else
+        {
+            RHICmdList.Transition(FRHITransitionInfo(SortedIndexUAV, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+        }
 
         // Large scenes can exceed the maximum X dispatch-group count supported by the RHI.
         // Split the global splat stream into several dispatches; SplatDispatchOffset lets
@@ -550,7 +560,14 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
 
         // The following GPU sort and indirect-args passes read the generated keys/counter.
         RHICmdList.Transition(FRHITransitionInfo(GPUSortKeyUAV[0], ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
-        RHICmdList.Transition(FRHITransitionInfo(GPUSortValueUAV[0], ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+        if (!bUseStochasticSplat)
+        {
+            RHICmdList.Transition(FRHITransitionInfo(GPUSortValueUAV[0], ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+        }
+        else
+        {
+            RHICmdList.Transition(FRHITransitionInfo(SortedIndexUAV, ERHIAccess::UAVCompute, ERHIAccess::SRVMask));
+        }
         RHICmdList.Transition(FRHITransitionInfo(VisibleCountUAV, ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
     }
 
@@ -561,7 +578,13 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
     //    its active element count without a CPU readback.
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_SortGPUBuffers_RT);
-        if (bUseDeviceRadixSort)
+        if (bUseStochasticSplat)
+        {
+            // The compact cull output is already the final (intentionally unsorted)
+            // draw list. The stochastic depth-writing raster path resolves visibility.
+            RHI_BREADCRUMB_EVENT_STAT(RHICmdList, GaussianSplatGPUSort, "GaussianSplat_StochasticNoSort");
+        }
+        else if (bUseDeviceRadixSort)
         {
             // ---- Tuned DeviceRadixSort path ----
             // Configurable 8-bit LSD passes with identity-payload generation and an optional

@@ -119,6 +119,7 @@ float2    SceneDepthViewportMin;
 float2    SceneDepthViewportSize;
 float2    SceneDepthTextureExtentInverse;
 uint      UseManualSceneDepthTest;
+uint      StochasticFrameIndex;
 int       TotalSplatCount;  // total splats across all objects
 int       ObjectCount;
 uint      EnableAntialiasing;
@@ -412,6 +413,9 @@ struct FVSOutput
     nointerpolation float2 ScreenCenter : TEXCOORD0;
     nointerpolation float3 Conic : TEXCOORD1;
 #endif
+#if STOCHASTIC_SPLAT
+    nointerpolation uint SplatID : TEXCOORD2;
+#endif
 };
 
 FVSOutput MakeInvalidOutput()
@@ -424,6 +428,9 @@ FVSOutput MakeInvalidOutput()
 #else
     Out.ScreenCenter = float2(0, 0);
     Out.Conic = float3(0, 0, 0);
+#endif
+#if STOCHASTIC_SPLAT
+    Out.SplatID = 0u;
 #endif
     return Out;
 }
@@ -583,6 +590,9 @@ FVSOutput GaussianSplatVS(uint VertexID : SV_VertexID)
     Out.ScreenCenter = screenCenter;
     Out.Conic = conic;
 #endif
+#if STOCHASTIC_SPLAT
+    Out.SplatID = globalIdx;
+#endif
 
     return Out;
 }
@@ -732,6 +742,9 @@ void GaussianSplatMS(
                                 Out.ScreenCenter = screenCenter;
                                 Out.Conic = conic;
 #endif
+#if STOCHASTIC_SPLAT
+                                Out.SplatID = globalIdx;
+#endif
                                 ProjectedVertices[CornerIndex] = Out;
                             }
                         }
@@ -754,6 +767,30 @@ void GaussianSplatMS(
 }
 
 #endif // MESHSHADER
+
+#if STOCHASTIC_SPLAT
+// Stochastic transparency turns a continuous per-fragment alpha into a Bernoulli
+// coverage decision. Hashing (pixel, splat, frame) gives each overlapping splat an
+// independent sample at the same pixel and changes that sample between temporal frames.
+// This is a fast, deterministic integer hash rather than a cryptographic random generator.
+uint GaussianStochasticHash(uint Value)
+{
+    Value ^= Value >> 16u;
+    Value *= 0x7feb352du;
+    Value ^= Value >> 15u;
+    Value *= 0x846ca68bu;
+    Value ^= Value >> 16u;
+    return Value;
+}
+
+float GaussianStochasticRandom(uint2 Pixel, uint SplatID, uint FrameIndex)
+{
+    uint seed = Pixel.x * 0x9e3779b9u ^ Pixel.y * 0x85ebca6bu;
+    seed ^= SplatID * 0xc2b2ae35u ^ FrameIndex * 0x27d4eb2fu;
+    // Keep 24 bits, matching float's useful integer precision, and map them to [0, 1).
+    return float(GaussianStochasticHash(seed) & 0x00ffffffu) * (1.0f / 16777216.0f);
+}
+#endif
 
 // ============================================================
 // PIXEL SHADER
@@ -789,7 +826,26 @@ float4 GaussianSplatPS(FVSOutput In) : SV_Target0
 
     if (alpha <= (1.0f / 255.0f)) discard;
 
+#if STOCHASTIC_SPLAT
+    // Keep this fragment as an opaque depth-writing sample with probability alpha;
+    // discard it with probability (1 - alpha). For one layer, the expected sample is
+    // therefore E[colorSample] = alpha * color, matching its alpha-blended contribution.
+    //
+    // With overlapping layers, the depth test selects the nearest surviving sample.
+    // A layer i is visible with probability
+    //     alpha_i * product(1 - alpha_j) for every closer layer j,
+    // which is the same weight produced by front-to-back alpha compositing. The result is
+    // noisy in one frame, but independent FrameIndex samples converge toward the original
+    // transparent rendering when averaged by the temporal accumulation pass.
+    const uint2 pixel = uint2(max(floor(In.Position.xy), float2(0.0f, 0.0f)));
+    if (GaussianStochasticRandom(pixel, In.SplatID, StochasticFrameIndex) >= alpha)
+    {
+        discard;
+    }
+    return float4(In.SplatColor.rgb, 1.0f);
+#else
     return float4(In.SplatColor.rgb * alpha, alpha);
+#endif
 }
 
 struct FCompositeVSOutput
@@ -843,4 +899,16 @@ float4 GaussianSplatCompositePS(FCompositeVSOutput In) : SV_Target0
     }
 
     return float4(color * PreExposure, alpha);
+}
+
+Texture2D CurrentSampleTexture;
+Texture2D HistoryTexture;
+float CurrentSampleWeight;
+
+float4 GaussianSplatTemporalPS(FCompositeVSOutput In) : SV_Target0
+{
+    const int2 pixelCoord = int2(In.Position.xy);
+    const float4 currentSample = CurrentSampleTexture.Load(int3(pixelCoord, 0));
+    const float4 history = HistoryTexture.Load(int3(pixelCoord, 0));
+    return lerp(history, currentSample, saturate(CurrentSampleWeight));
 }

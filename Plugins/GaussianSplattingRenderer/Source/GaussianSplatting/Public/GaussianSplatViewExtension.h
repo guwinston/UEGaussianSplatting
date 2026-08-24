@@ -6,6 +6,7 @@
 #include "GaussianSplatSceneProxy.h"
 #include "RHIResources.h"
 #include "RenderGraphResources.h"
+#include "RenderTargetPool.h"
 #include "Misc/EngineVersionComparison.h"
 
 // Forward declarations: avoid including private/renderer headers in this public header.
@@ -152,6 +153,19 @@ private:
     /** Persistent per-object descriptor buffer. */
     TRefCountPtr<FRDGPooledBuffer> DynPerObjPooled;
     int32 DynPerObjCapacity = 0;  //< Number of uint4 slots allocated
+
+    struct FStochasticTemporalHistory
+    {
+        TRefCountPtr<IPooledRenderTarget> Texture;
+        uint32 Signature = 0;
+        uint32 SampleCount = 0;
+        FIntPoint Extent = FIntPoint::ZeroValue;
+        FIntRect ViewRect;
+    };
+
+    // One progressive history per persistent UE view state. Shared values keep the
+    // extraction destination stable if TMap storage is rehashed by another view.
+    TMap<const void*, TSharedPtr<FStochasticTemporalHistory>> StochasticTemporalHistories;
 
     /** Returns true if ValidProxies matches the current CachedProxySet and buffers are live. */
     bool IsStaticCacheValid(const TArray<const FGaussianSplatSceneProxy*>& ValidProxies) const;

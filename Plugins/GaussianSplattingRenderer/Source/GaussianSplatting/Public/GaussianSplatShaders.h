@@ -127,6 +127,9 @@ class GAUSSIANSPLATTING_API FGaussianBuildIndirectArgsCS : public FGlobalShader
 // ============================================================
 
 class FGaussianSplatRasterModeDim : SHADER_PERMUTATION_INT("RASTER_MODE", 2);
+class FGaussianSplatStochasticDim : SHADER_PERMUTATION_BOOL("STOCHASTIC_SPLAT");
+using FGaussianSplatRasterPermutationDomain = TShaderPermutationDomain<
+    FGaussianSplatRasterModeDim, FGaussianSplatStochasticDim>;
 
 // ============================================================
 //  Per-Object GPU Descriptor
@@ -227,7 +230,7 @@ class GAUSSIANSPLATTING_API FGaussianSplatVS : public FGlobalShader
         SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
     END_SHADER_PARAMETER_STRUCT()
 
-    using FPermutationDomain = TShaderPermutationDomain<FGaussianSplatRasterModeDim>;
+    using FPermutationDomain = FGaussianSplatRasterPermutationDomain;
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {
@@ -289,9 +292,10 @@ class GAUSSIANSPLATTING_API FGaussianSplatPS : public FGlobalShader
         SHADER_PARAMETER(FVector2f, SceneDepthViewportSize)
         SHADER_PARAMETER(FVector2f, SceneDepthTextureExtentInverse)
         SHADER_PARAMETER(uint32, UseManualSceneDepthTest)
+        SHADER_PARAMETER(uint32, StochasticFrameIndex)
     END_SHADER_PARAMETER_STRUCT()
 
-    using FPermutationDomain = TShaderPermutationDomain<FGaussianSplatRasterModeDim>;
+    using FPermutationDomain = FGaussianSplatRasterPermutationDomain;
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {
@@ -343,6 +347,23 @@ class GAUSSIANSPLATTING_API FGaussianSplatCompositePS : public FGlobalShader
     }
 };
 
+class GAUSSIANSPLATTING_API FGaussianSplatTemporalPS : public FGlobalShader
+{
+    DECLARE_GLOBAL_SHADER(FGaussianSplatTemporalPS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatTemporalPS, FGlobalShader);
+
+    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, CurrentSampleTexture)
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HistoryTexture)
+        SHADER_PARAMETER(float, CurrentSampleWeight)
+    END_SHADER_PARAMETER_STRUCT()
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::ES3_1);
+    }
+};
+
 // ============================================================
 //  Combined pass parameters
 // ============================================================
@@ -355,5 +376,10 @@ END_SHADER_PARAMETER_STRUCT()
 
 BEGIN_SHADER_PARAMETER_STRUCT(FGaussianSplatCompositePassParameters, )
     SHADER_PARAMETER_STRUCT_INCLUDE(FGaussianSplatCompositePS::FParameters, PS)
+    RENDER_TARGET_BINDING_SLOTS()
+END_SHADER_PARAMETER_STRUCT()
+
+BEGIN_SHADER_PARAMETER_STRUCT(FGaussianSplatTemporalPassParameters, )
+    SHADER_PARAMETER_STRUCT_INCLUDE(FGaussianSplatTemporalPS::FParameters, PS)
     RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()

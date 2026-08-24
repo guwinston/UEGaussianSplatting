@@ -46,7 +46,16 @@ static TAutoConsoleVariable<int32> CVarGaussianSplatSortMethod(
     1,
     TEXT("GPU sort algorithm for Gaussian splat depth ordering.\n")
     TEXT(" 0 = UE built-in SortGPUBuffers (default)\n")
-    TEXT(" 1 = DeviceRadixSort (configurable 8-bit LSD passes)"),
+    TEXT(" 1 = DeviceRadixSort (configurable 8-bit LSD passes)\n")
+    TEXT(" 2 = stochastic splat (compact visible IDs, skip sorting; experimental)"),
+    ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarGaussianSplatStochasticTemporalSamples(
+    TEXT("r.GaussianSplat.StochasticTemporalSamples"),
+    1000,
+    TEXT("Number of independent stochastic frames accumulated per stable view (0-4096).\n")
+    TEXT(" 0 = disable accumulation and display the raw noisy sample\n")
+    TEXT(" N = running-average N samples, then freeze until the view or scene changes"),
     ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarGaussianSplatDeviceRadixPasses(
@@ -184,7 +193,12 @@ namespace GaussianSplatCVars
 
     int32 GetSortMethodOnRenderThread()
     {
-        return FMath::Clamp(CVarGaussianSplatSortMethod.GetValueOnRenderThread(), 0, 1);
+        return FMath::Clamp(CVarGaussianSplatSortMethod.GetValueOnRenderThread(), 0, 2);
+    }
+
+    int32 GetStochasticTemporalSamplesOnRenderThread()
+    {
+        return FMath::Clamp(CVarGaussianSplatStochasticTemporalSamples.GetValueOnRenderThread(), 0, 4096);
     }
 
     int32 GetDeviceRadixPassCountOnRenderThread()
