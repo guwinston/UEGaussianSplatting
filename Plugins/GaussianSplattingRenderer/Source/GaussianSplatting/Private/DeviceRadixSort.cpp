@@ -5,6 +5,7 @@
 #include "RenderGraphUtils.h"
 #include "RHI.h"
 
+IMPLEMENT_GLOBAL_SHADER(FDeviceRadixBuildIndirectArgsCS, "/Plugin/GaussianSplattingRenderer/Sort/DeviceRadixIndirectArgs.usf", "BuildIndirectArgs", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FDeviceRadixUpsweepCS, "/Plugin/GaussianSplattingRenderer/Sort/DeviceRadixSort.usf", "Upsweep", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FDeviceRadixScanCS, "/Plugin/GaussianSplattingRenderer/Sort/DeviceRadixSort.usf", "Scan", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FDeviceRadixDownsweepCS, "/Plugin/GaussianSplattingRenderer/Sort/DeviceRadixSort.usf", "Downsweep", SF_Compute);
@@ -36,6 +37,11 @@ namespace
 			OutEnvironment.CompilerFlags.Add(CFLAG_WaveOperations);
 		}
 	}
+}
+
+bool FDeviceRadixBuildIndirectArgsCS::ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+{
+	return ShouldCompileDeviceRadix(Parameters);
 }
 
 bool FDeviceRadixUpsweepCS::ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -93,7 +99,8 @@ namespace DeviceRadixSort
 		uint32 ElementCount,
 		FRDGBufferRef FinalValues,
 		bool* bOutResultInInputBuffers,
-		const FOptions* Options)
+		const FOptions* Options,
+		FRDGBufferRef ElementCountBuffer)
 	{
 		check(Keys[0] && Keys[1] && Values[0] && Values[1]);
 		check(ElementCount > 0u);
@@ -106,7 +113,28 @@ namespace DeviceRadixSort
 			&& ResolvedOptions.FirstBit + ResolvedOptions.PassCount * 8u <= 32u,
 			TEXT("DeviceRadixSort bit range must be byte aligned and contained in a 32-bit key."));
 
+		const bool bUseIndirectCount = ElementCountBuffer != nullptr;
+		const FRDGBufferSRVRef ElementCountSRV = bUseIndirectCount
+			? GraphBuilder.CreateSRV(FRDGBufferSRVDesc(ElementCountBuffer, PF_R32_UINT))
+			: nullptr;
 		const uint32 ThreadBlocks = FMath::DivideAndRoundUp(ElementCount, PartitionSize);
+		FRDGBufferRef IndirectArgsBuffer = nullptr;
+		if (bUseIndirectCount)
+		{
+			IndirectArgsBuffer = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateIndirectDesc<FRHIDispatchIndirectParameters>(),
+				TEXT("DeviceRadix.IndirectArgs"));
+			FDeviceRadixBuildIndirectArgsCS::FParameters* Parameters =
+				GraphBuilder.AllocParameters<FDeviceRadixBuildIndirectArgsCS::FParameters>();
+			Parameters->Divisor = PartitionSize;
+			Parameters->InputCount = ElementCountSRV;
+			Parameters->OutIndirectArgs = GraphBuilder.CreateUAV(
+				FRDGBufferUAVDesc(IndirectArgsBuffer, PF_R32_UINT));
+			TShaderMapRef<FDeviceRadixBuildIndirectArgsCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(
+				GraphBuilder, RDG_EVENT_NAME("DeviceRadix.BuildIndirectArgs"),
+				Shader, Parameters, FIntVector(1, 1, 1));
+		}
 		const FRDGBufferDesc PassHistogramDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), ThreadBlocks * Radix);
 		const FRDGBufferDesc GlobalHistogramDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), ResolvedOptions.PassCount * Radix);
 		FRDGBufferRef PassHistogram = GraphBuilder.CreateBuffer(PassHistogramDesc, TEXT("DeviceRadix.PassHistogram"));
@@ -149,11 +177,22 @@ namespace DeviceRadixSort
 				Parameters->e_radixShift = RadixShift;
 				Parameters->e_threadBlocks = ThreadBlocks;
 				Parameters->e_passIndex = Pass;
+				Parameters->b_numKeys = ElementCountSRV;
 				Parameters->b_sort = KeySRVs[SrcIndex];
 				Parameters->b_globalHist = GlobalHistogramRW;
 				Parameters->b_passHist = PassHistogramRW;
-				TShaderMapRef<FDeviceRadixUpsweepCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("DeviceRadix.Upsweep pass=%u", Pass), Shader, Parameters, FIntVector(ThreadBlocks, 1, 1));
+				Parameters->IndirectArgs = IndirectArgsBuffer;
+				FDeviceRadixUpsweepCS::FPermutationDomain PermutationVector;
+				PermutationVector.Set<FDeviceRadixIndirectCountDim>(bUseIndirectCount);
+				TShaderMapRef<FDeviceRadixUpsweepCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PermutationVector);
+				if (bUseIndirectCount)
+				{
+					FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("DeviceRadix.Upsweep pass=%u", Pass), Shader, Parameters, IndirectArgsBuffer, 0u);
+				}
+				else
+				{
+					FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("DeviceRadix.Upsweep pass=%u", Pass), Shader, Parameters, FIntVector(ThreadBlocks, 1, 1));
+				}
 			}
 
 			{
@@ -161,8 +200,11 @@ namespace DeviceRadixSort
 				Parameters->e_numKeys = ElementCount;
 				Parameters->e_radixShift = RadixShift;
 				Parameters->e_threadBlocks = ThreadBlocks;
+				Parameters->b_numKeys = ElementCountSRV;
 				Parameters->b_passHist = PassHistogramRW;
-				TShaderMapRef<FDeviceRadixScanCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FDeviceRadixScanCS::FPermutationDomain PermutationVector;
+				PermutationVector.Set<FDeviceRadixIndirectCountDim>(bUseIndirectCount);
+				TShaderMapRef<FDeviceRadixScanCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PermutationVector);
 				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("DeviceRadix.Scan pass=%u", Pass), Shader, Parameters, FIntVector(Radix, 1, 1));
 			}
 
@@ -172,19 +214,29 @@ namespace DeviceRadixSort
 				Parameters->e_radixShift = RadixShift;
 				Parameters->e_threadBlocks = ThreadBlocks;
 				Parameters->e_passIndex = Pass;
+				Parameters->b_numKeys = ElementCountSRV;
 				Parameters->b_sort = KeySRVs[SrcIndex];
 				Parameters->b_sortPayload = ValueSRVs[SrcIndex];
 				Parameters->b_alt = KeyUAVs[DstIndex];
 				Parameters->b_altPayload = bFinalPass && FinalValueUAV ? FinalValueUAV : ValueUAVs[DstIndex];
 				Parameters->b_globalHist = GlobalHistogramRW;
 				Parameters->b_passHist = PassHistogramRW;
+				Parameters->IndirectArgs = IndirectArgsBuffer;
 				FDeviceRadixDownsweepCS::FPermutationDomain PermutationVector;
 				PermutationVector.Set<FDeviceRadixWriteKeysDim>(
 					!bFinalPass || ResolvedOptions.bWriteFinalKeys);
 				PermutationVector.Set<FDeviceRadixIdentityPayloadDim>(
 					Pass == 0u && ResolvedOptions.bFirstPayloadIsIdentity);
+				PermutationVector.Set<FDeviceRadixIndirectCountDim>(bUseIndirectCount);
 				TShaderMapRef<FDeviceRadixDownsweepCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PermutationVector);
-				FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("DeviceRadix.Downsweep pass=%u", Pass), Shader, Parameters, FIntVector(ThreadBlocks, 1, 1));
+				if (bUseIndirectCount)
+				{
+					FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("DeviceRadix.Downsweep pass=%u", Pass), Shader, Parameters, IndirectArgsBuffer, 0u);
+				}
+				else
+				{
+					FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("DeviceRadix.Downsweep pass=%u", Pass), Shader, Parameters, FIntVector(ThreadBlocks, 1, 1));
+				}
 			}
 		}
 

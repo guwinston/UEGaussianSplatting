@@ -8,20 +8,42 @@
 
 class FRDGBuilder;
 
+class FDeviceRadixIndirectCountDim : SHADER_PERMUTATION_BOOL("DEVICE_RADIX_INDIRECT_COUNT");
+using FDeviceRadixCountPermutationDomain = TShaderPermutationDomain<FDeviceRadixIndirectCountDim>;
+
+class FDeviceRadixBuildIndirectArgsCS final : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FDeviceRadixBuildIndirectArgsCS);
+	SHADER_USE_PARAMETER_STRUCT(FDeviceRadixBuildIndirectArgsCS, FGlobalShader);
+
+public:
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(uint32, Divisor)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, InputCount)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutIndirectArgs)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters);
+};
+
 class FDeviceRadixUpsweepCS final : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FDeviceRadixUpsweepCS);
 	SHADER_USE_PARAMETER_STRUCT(FDeviceRadixUpsweepCS, FGlobalShader);
 
 public:
+	using FPermutationDomain = FDeviceRadixCountPermutationDomain;
+
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER(uint32, e_numKeys)
 		SHADER_PARAMETER(uint32, e_radixShift)
 		SHADER_PARAMETER(uint32, e_threadBlocks)
 		SHADER_PARAMETER(uint32, e_passIndex)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, b_numKeys)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, b_sort)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, b_globalHist)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, b_passHist)
+		RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters);
@@ -34,10 +56,13 @@ class FDeviceRadixScanCS final : public FGlobalShader
 	SHADER_USE_PARAMETER_STRUCT(FDeviceRadixScanCS, FGlobalShader);
 
 public:
+	using FPermutationDomain = FDeviceRadixCountPermutationDomain;
+
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER(uint32, e_numKeys)
 		SHADER_PARAMETER(uint32, e_radixShift)
 		SHADER_PARAMETER(uint32, e_threadBlocks)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, b_numKeys)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, b_passHist)
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -47,7 +72,10 @@ public:
 
 class FDeviceRadixWriteKeysDim : SHADER_PERMUTATION_BOOL("DEVICE_RADIX_WRITE_KEYS");
 class FDeviceRadixIdentityPayloadDim : SHADER_PERMUTATION_BOOL("DEVICE_RADIX_IDENTITY_PAYLOAD");
-using FDeviceRadixDownsweepPermutationDomain = TShaderPermutationDomain<FDeviceRadixWriteKeysDim, FDeviceRadixIdentityPayloadDim>;
+using FDeviceRadixDownsweepPermutationDomain = TShaderPermutationDomain<
+	FDeviceRadixWriteKeysDim,
+	FDeviceRadixIdentityPayloadDim,
+	FDeviceRadixIndirectCountDim>;
 
 class FDeviceRadixDownsweepCS final : public FGlobalShader
 {
@@ -62,12 +90,14 @@ public:
 		SHADER_PARAMETER(uint32, e_radixShift)
 		SHADER_PARAMETER(uint32, e_threadBlocks)
 		SHADER_PARAMETER(uint32, e_passIndex)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, b_numKeys)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, b_sort)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, b_sortPayload)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, b_alt)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, b_altPayload)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, b_globalHist)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, b_passHist)
+		RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters);
@@ -97,6 +127,8 @@ namespace DeviceRadixSort
 	/**
 	 * Sorts ascending 32-bit key/value pairs using the DeviceRadixSort kernel topology.
 	 * When FinalValues is provided, the last pass writes payloads there directly.
+	 * When ElementCountBuffer is provided, ElementCount is treated as the allocation
+	 * capacity while the active count and dispatch size are read entirely on the GPU.
 	 */
 	void Enqueue(
 		FRDGBuilder& GraphBuilder,
@@ -105,5 +137,6 @@ namespace DeviceRadixSort
 		uint32 ElementCount,
 		FRDGBufferRef FinalValues = nullptr,
 		bool* bOutResultInInputBuffers = nullptr,
-		const FOptions* Options = nullptr);
+		const FOptions* Options = nullptr,
+		FRDGBufferRef ElementCountBuffer = nullptr);
 }

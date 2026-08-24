@@ -47,6 +47,7 @@ inline void MobileSafeExclusiveScan256(uint gtid)
 void Upsweep(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
     const uint gtid = groupThreadId.x;
+    InitDeviceRadixCount(gtid);
     const uint gid = groupId.x;
 
     for (uint digit = gtid; digit < RADIX; digit += US_DIM)
@@ -118,6 +119,11 @@ inline void MobileSafeExclusiveScan128(uint gtid)
 void Scan(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
     const uint gtid = groupThreadId.x;
+    InitDeviceRadixCount(gtid);
+    if (e_threadBlocks == 0U)
+    {
+        return;
+    }
     const uint digitOffset = groupId.x * e_threadBlocks;
 
     if (gtid == 0U)
@@ -154,6 +160,7 @@ void Scan(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 void Downsweep(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
     const uint gtid = groupThreadId.x;
+    InitDeviceRadixCount(gtid);
     const uint gid = groupId.x;
 
     for (uint index = gtid; index < MOBILE_SAFE_MASK_COUNT; index += D_DIM)

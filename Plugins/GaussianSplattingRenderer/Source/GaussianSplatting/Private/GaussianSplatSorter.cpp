@@ -201,17 +201,16 @@ bool FGaussianSplatSorter::TryConsumeSorted(
     SET_DWORD_STAT(STAT_GaussianSplat_SplatsBeforeCull, static_cast<uint32>(FMath::Max<int32>(0, RequestedTotalSplats)));
 
     // "After Cull" (visible splats) is a GPU value written by the per-splat cull pass into
-    // VisibleCountBufferRHI. It was copied into an async readback during the previous sort; read
-    // it back now. Lock() blocks until the GPU fence is signaled, so the stat always gets a valid
-    // value (lagging ~1 frame behind the current view).
-    if (VisibleCountReadback && bVisibleCountReadbackPending)
+    // VisibleCountBufferRHI. Never lock an unfinished readback: doing so can stall the render
+    // thread behind the GPU just to update a diagnostic counter.
+    if (VisibleCountReadback && bVisibleCountReadbackPending && VisibleCountReadback->IsReady())
     {
         if (void* Data = VisibleCountReadback->Lock(sizeof(uint32)))
         {
             const uint32 VisibleSplats = *static_cast<uint32*>(Data);
             SET_DWORD_STAT(STAT_GaussianSplat_SplatsAfterCull, VisibleSplats);
+            VisibleCountReadback->Unlock();
         }
-        VisibleCountReadback->Unlock();
         bVisibleCountReadbackPending = false;
     }
 
@@ -448,22 +447,26 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
         EnsureDrawIndirectArgsBuffer(RHICmdList);
     }
 
-    // Reset the visible-splat counter before the GPU cull/keygen pass accumulates into it.
+    // Reset on the GPU. LockBuffer on this persistent resource can serialize the render
+    // thread with a previous frame that is still consuming the counter.
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_ResetVisibleCount_RT);
-        uint32* VisibleCountDst = static_cast<uint32*>(RHICmdList.LockBuffer(
-            VisibleCountBufferRHI,
-            0,
-            sizeof(uint32),
-            RLM_WriteOnly));
-        VisibleCountDst[0] = 0u;
-        RHICmdList.UnlockBuffer(VisibleCountBufferRHI);
+        RHICmdList.Transition(FRHITransitionInfo(VisibleCountUAV, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+        RHICmdList.ClearUAVUint(VisibleCountUAV, FUintVector4(0u, 0u, 0u, 0u));
     }
 
     FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
     if (!ShaderMap)
     {
         return false;
+    }
+
+    bool bUseDeviceRadixSort = GaussianSplatCVars::GetSortMethodOnRenderThread() == 1;
+    if (bUseDeviceRadixSort && !DeviceRadixSort::IsSupported())
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("GaussianSplat: DeviceRadixSort is unsupported on this RHI; falling back to SortGPUBuffers."));
+        bUseDeviceRadixSort = false;
     }
 
     // 1. Object-level cull.
@@ -491,9 +494,8 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
     }
 
     // 2. Per-splat cull + depth-key generation.
-    //    This walks the full merged global splat stream. Visible splats contribute to the
-    //    visible counter and receive a sortable negative-depth key; culled splats receive
-    //    a maximal key so they sort to the tail and are skipped by indirect draw.
+    //    DeviceRadix compacts visible key/value pairs into [0, VisibleCount), while the UE
+    //    built-in fallback retains the full key stream and moves culled splats to the tail.
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_BuildSortKeysCS_RT);
         RHI_BREADCRUMB_EVENT_STAT(RHICmdList, GaussianSplatSortKeyGen, "GaussianSplat_SortKeyGen");
@@ -517,13 +519,14 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
         Parameters.ScreenSizeCullMinPixels = GaussianSplatCVars::GetScreenSizeCullMinPixelsOnAnyThread();
         Parameters.MaxFocalLengthPixels = RequestedMaxFocalLengthPixels;
         Parameters.WorldToView = RequestedWorldToView;
+        Parameters.CompactVisibleOutput = bUseDeviceRadixSort ? 1u : 0u;
         Parameters.OutDepthKeys = GPUSortKeyUAV[0];
+        Parameters.OutSortValues = GPUSortValueUAV[0];
         Parameters.OutVisibleCount = VisibleCountUAV;
 
-        // The key-generation shader writes both the sortable depth-key stream and the
-        // visible splat counter, so both resources must be in UAV state for this pass.
+        // VisibleCount is already in UAV state after the GPU clear above.
         RHICmdList.Transition(FRHITransitionInfo(GPUSortKeyUAV[0], ERHIAccess::Unknown, ERHIAccess::UAVCompute));
-        RHICmdList.Transition(FRHITransitionInfo(VisibleCountUAV, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+        RHICmdList.Transition(FRHITransitionInfo(GPUSortValueUAV[0], ERHIAccess::Unknown, ERHIAccess::UAVCompute));
 
         // Large scenes can exceed the maximum X dispatch-group count supported by the RHI.
         // Split the global splat stream into several dispatches; SplatDispatchOffset lets
@@ -547,22 +550,17 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
 
         // The following GPU sort and indirect-args passes read the generated keys/counter.
         RHICmdList.Transition(FRHITransitionInfo(GPUSortKeyUAV[0], ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+        RHICmdList.Transition(FRHITransitionInfo(GPUSortValueUAV[0], ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
         RHICmdList.Transition(FRHITransitionInfo(VisibleCountUAV, ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
     }
 
-    // 3. GPU radix sort over the full global splat stream.
-    //    Keys come from the previous pass, and values are the identity global-splat index
-    //    stream. The final output is therefore a sorted permutation of global splat indices.
+    FRDGBufferRef VisibleCountBuffer = GraphBuilder.RegisterExternalBuffer(
+        VisibleCountPooled, TEXT("GS_VisibleSplatCount"));
+
+    // 3. GPU radix sort. DeviceRadix consumes only the compact visible prefix and obtains
+    //    its active element count without a CPU readback.
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_SortGPUBuffers_RT);
-        bool bUseDeviceRadixSort =
-            GaussianSplatCVars::GetSortMethodOnRenderThread() == 1;
-        if (bUseDeviceRadixSort && !DeviceRadixSort::IsSupported())
-        {
-            UE_LOG(LogTemp, Warning, TEXT("GaussianSplat: DeviceRadixSort requires wave operations on this RHI; falling back to SortGPUBuffers."));
-            bUseDeviceRadixSort = false;
-        }
-
         if (bUseDeviceRadixSort)
         {
             // ---- Tuned DeviceRadixSort path ----
@@ -585,7 +583,7 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
                 SortOptions.PassCount = PassCount;
                 SortOptions.FirstBit = 32u - PassCount * 8u;
                 SortOptions.bWriteFinalKeys = GaussianSplatCVars::GetDeviceRadixWriteFinalKeysOnRenderThread() != 0;
-                SortOptions.bFirstPayloadIsIdentity = true;
+                SortOptions.bFirstPayloadIsIdentity = false;
 
                 DeviceRadixSort::Enqueue(
                     GraphBuilder,
@@ -594,7 +592,8 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
                     static_cast<uint32>(TotalSplatCount),
                     RDGSortedIndex,
                     nullptr,
-                    &SortOptions);
+                    &SortOptions,
+                    VisibleCountBuffer);
 
                 // The final downsweep writes values directly to the persistent output buffer.
             }
@@ -646,7 +645,6 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
 
     // 5. Re-expose the persistent result buffers as RDG resources for the current frame.
     FRDGBufferRef SortedIndexBuffer = GraphBuilder.RegisterExternalBuffer(SortedIndexPooled, TEXT("GS_SortedGlobalSplatIndices"));
-    FRDGBufferRef VisibleCountBuffer = GraphBuilder.RegisterExternalBuffer(VisibleCountPooled, TEXT("GS_VisibleSplatCount"));
     FRDGBufferRef DrawIndirectArgsBuffer = GraphBuilder.RegisterExternalBuffer(DrawIndirectArgsPooled, TEXT("GS_SplatDrawIndirectArgs"));
     OutBuffers.SortedIndexSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SortedIndexBuffer, PF_R32_UINT));
     OutBuffers.VisibleCountSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(VisibleCountBuffer, PF_R32_UINT));

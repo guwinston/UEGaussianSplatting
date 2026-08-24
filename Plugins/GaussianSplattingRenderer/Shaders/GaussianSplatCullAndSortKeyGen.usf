@@ -17,6 +17,7 @@ Buffer<uint> VisibleCountBuffer;
 
 RWBuffer<uint> OutObjectVisibility;
 RWBuffer<uint> OutDepthKeys;
+RWBuffer<uint> OutSortValues;
 RWBuffer<uint> OutVisibleCount;
 RWBuffer<uint> OutDrawIndirectArgs;
 
@@ -30,6 +31,7 @@ float FrustumSlack;
 uint EnableScreenSizeCull;
 float ScreenSizeCullMinPixels;
 float MaxFocalLengthPixels;
+uint CompactVisibleOutput;
 float4x4 WorldToView;
 float4x4 ViewToClip;
 
@@ -257,10 +259,10 @@ void CullObjectsCS(uint3 ThreadId : SV_DispatchThreadID)
 //   3. depth-key generation for surviving splats
 //   4. visible-splat counting for indirect draw
 //
-// The output key buffer is full-sized over the entire global splat stream.
-// Culled splats are not compacted out here; instead they receive a maximal
-// key so they sort to the tail, while VisibleCount determines how large the
-// final draw prefix is.
+// DeviceRadix writes visible key/value pairs into a compact [0, VisibleCount)
+// stream so culling reduces the radix-sort workload as well as raster work.
+// The UE built-in sort fallback keeps the legacy full stream and moves culled
+// splats to the tail because that API requires a CPU-known element count.
 // ------------------------------------------------------------
 [numthreads(THREAD_GROUP_SIZE, 1, 1)]
 void BuildSortKeysCS(uint3 ThreadId : SV_DispatchThreadID)
@@ -344,17 +346,22 @@ void BuildSortKeysCS(uint3 ThreadId : SV_DispatchThreadID)
     if (bVisible)
     {
         uint previousVisibleCount;
-        // Count visible splats on the GPU so the later indirect draw can render
-        // only the visible prefix of the sorted index stream.
         InterlockedAdd(OutVisibleCount[0], 1u, previousVisibleCount);
-        // Back-to-front blending needs farther splats first. Using -viewPos.z
-        // converts larger depth (farther away) into smaller sortable values.
-        OutDepthKeys[globalSplatIndex] = FloatToSortableUint(-viewPos.z);
+        const uint outputIndex = CompactVisibleOutput != 0u
+            ? previousVisibleCount
+            : globalSplatIndex;
+        OutDepthKeys[outputIndex] = FloatToSortableUint(-viewPos.z);
+
+        if (CompactVisibleOutput != 0u)
+        {
+            // The compact payload preserves the original global splat ID; it
+            // replaces DeviceRadix's identity-payload generation in pass zero.
+            OutSortValues[outputIndex] = globalSplatIndex;
+        }
     }
-    else
+    else if (CompactVisibleOutput == 0u)
     {
-        // Culled splats are pushed to the end of the sorted stream instead of
-        // being compacted out in this pass.
+        // Legacy full-stream behavior used by UE's built-in GPU sort.
         OutDepthKeys[globalSplatIndex] = 0xFFFFFFFFu;
     }
 }

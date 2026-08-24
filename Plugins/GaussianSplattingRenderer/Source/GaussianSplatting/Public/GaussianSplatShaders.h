@@ -74,7 +74,9 @@ class GAUSSIANSPLATTING_API FGaussianBuildSortKeysCS : public FGlobalShader
         SHADER_PARAMETER(float, ScreenSizeCullMinPixels)
         SHADER_PARAMETER(float, MaxFocalLengthPixels)
         SHADER_PARAMETER(FMatrix44f, WorldToView)
+        SHADER_PARAMETER(uint32, CompactVisibleOutput)
         SHADER_PARAMETER_UAV(RWBuffer<uint32>, OutDepthKeys)
+        SHADER_PARAMETER_UAV(RWBuffer<uint32>, OutSortValues)
         SHADER_PARAMETER_UAV(RWBuffer<uint32>, OutVisibleCount)
     END_SHADER_PARAMETER_STRUCT()
 

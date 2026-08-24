@@ -41,6 +41,36 @@ uint e_radixShift;
 uint e_threadBlocks;
 uint e_passIndex;
 
+#ifndef DEVICE_RADIX_INDIRECT_COUNT
+#define DEVICE_RADIX_INDIRECT_COUNT 0
+#endif
+
+#if DEVICE_RADIX_INDIRECT_COUNT
+Buffer<uint> b_numKeys;
+groupshared uint g_deviceRadixNumKeys;
+groupshared uint g_deviceRadixThreadBlocks;
+
+inline void InitDeviceRadixCount(uint groupThreadId)
+{
+    if (groupThreadId == 0U)
+    {
+        g_deviceRadixNumKeys = b_numKeys[0];
+        g_deviceRadixThreadBlocks =
+            (g_deviceRadixNumKeys + PART_SIZE - 1U) / PART_SIZE;
+    }
+    GroupMemoryBarrierWithGroupSync();
+}
+
+// Preserve the original kernel source while replacing the CPU constants with
+// one GPU count load per workgroup in the indirect-count permutation.
+#define e_numKeys g_deviceRadixNumKeys
+#define e_threadBlocks g_deviceRadixThreadBlocks
+#else
+inline void InitDeviceRadixCount(uint groupThreadId)
+{
+}
+#endif
+
 #ifndef DEVICE_RADIX_WRITE_KEYS
 #define DEVICE_RADIX_WRITE_KEYS 1
 #endif

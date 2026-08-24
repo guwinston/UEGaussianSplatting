@@ -1,0 +1,17 @@
+#include "/Engine/Public/Platform.ush"
+
+// Builds DispatchIndirect arguments from the GPU-visible splat count.
+// A dedicated typed-buffer pass is used because UE's generic helper expects a
+// StructuredBuffer count, while the persistent Gaussian counter is a Buffer<uint>.
+
+Buffer<uint> InputCount;
+RWBuffer<uint> OutIndirectArgs;
+uint Divisor;
+
+[numthreads(1, 1, 1)]
+void BuildIndirectArgs(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	OutIndirectArgs[0] = (InputCount[0] + Divisor - 1u) / Divisor;
+	OutIndirectArgs[1] = 1u;
+	OutIndirectArgs[2] = 1u;
+}
