@@ -1,17 +1,22 @@
 #include "GaussianSplatSorter.h"
 #include "GaussianSplatCVars.h"
 #include "GaussianSplatShaders.h"
+#include "GaussianSplatStats.h"
+#include "RHIGPUReadback.h"
 
 #include "GPUSort.h"
 #include "GPUProfiler.h"
+#include "RHIBreadcrumbs.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "ShaderParameterUtils.h"
+#include "DeviceRadixSort.h"
 
 DECLARE_GPU_STAT_NAMED(GaussianSplatObjectCull, TEXT("Gaussian Splat Object Cull"));
 DECLARE_GPU_STAT_NAMED(GaussianSplatSortKeyGen, TEXT("Gaussian Splat Sort Key Gen"));
-DECLARE_GPU_STAT_NAMED(GaussianSplatGPUSort, TEXT("Gaussian Splat GPU Sort"));
+DECLARE_GPU_STAT_NAMED(GaussianSplatGPUSort, TEXT("Gaussian Splat GPU Sort (UE Built-in)"));
+DECLARE_GPU_STAT_NAMED(GaussianSplatDeviceRadixSort, TEXT("Gaussian Splat GPU Sort (DeviceRadix)"));
 DECLARE_GPU_STAT_NAMED(GaussianSplatIndirectArgs, TEXT("Gaussian Splat Indirect Args"));
 
 namespace
@@ -71,6 +76,13 @@ void FGaussianSplatSorter::Shutdown()
     DrawIndirectArgsPooled.SafeRelease();
     DrawIndirectArgsBufferRHI.SafeRelease();
     DrawIndirectArgsUAV.SafeRelease();
+
+    if (VisibleCountReadback)
+    {
+        delete VisibleCountReadback;
+        VisibleCountReadback = nullptr;
+    }
+    bVisibleCountReadbackPending = false;
 }
 
 // ============================================================
@@ -91,6 +103,7 @@ bool FGaussianSplatSorter::RequestSort(
     const FMatrix44f& InViewToClip,
     float InTanHalfFovX,
     float InTanHalfFovY,
+    float InMaxFocalLengthPixels,
     int32 InTotalSplats,
     bool bLazy)
 {
@@ -106,7 +119,7 @@ bool FGaussianSplatSorter::RequestSort(
         return false;
     }
 
-    // If sort-relevant runtime settings changed (currently cull mode), the previous GPU
+    // If sort-relevant runtime settings changed, the previous GPU
     // result can no longer be reused safely.
     if (LastSortConfigSignature != NewSortConfigSignature)
     {
@@ -119,7 +132,8 @@ bool FGaussianSplatSorter::RequestSort(
     // consuming the previous GPU result.
     if (bLazy && bHasValidSortResult
         && LastSortConfigSignature == NewSortConfigSignature
-        && LastSortedTotalSplats == InTotalSplats)
+        && LastSortedTotalSplats == InTotalSplats
+        && FMath::Abs(LastSortedMaxFocalLengthPixels - InMaxFocalLengthPixels) <= 1e-3f)
     {
         bool bSame = true;
         for (int32 Row = 0; Row < 4 && bSame; ++Row)
@@ -147,6 +161,7 @@ bool FGaussianSplatSorter::RequestSort(
     RequestedViewToClip = InViewToClip;
     RequestedTanHalfFovX = InTanHalfFovX;
     RequestedTanHalfFovY = InTanHalfFovY;
+    RequestedMaxFocalLengthPixels = InMaxFocalLengthPixels;
     RequestedTotalSplats = InTotalSplats;
     bHasPendingSortRequest = true;
     return true;
@@ -169,6 +184,7 @@ bool FGaussianSplatSorter::TryConsumeSorted(
     FRHICommandListImmediate& RHICmdList,
     const FShaderResourceViewRHIRef& GlobalPackedPositionSRV,
     const FShaderResourceViewRHIRef& GlobalPackedColorSRV,
+    const FShaderResourceViewRHIRef& GlobalPackedScaleSRV,
     const FShaderResourceViewRHIRef& GlobalChunkPositionMinSRV,
     const FShaderResourceViewRHIRef& GlobalChunkPositionMaxSRV,
     const FShaderResourceViewRHIRef& GlobalObjectIndexSRV,
@@ -177,6 +193,27 @@ bool FGaussianSplatSorter::TryConsumeSorted(
     FGaussianSplatSortedDrawBuffers& OutBuffers)
 {
     OutBuffers = {};
+
+    // ---- Stat updates (visible via `stat GaussianSplat`) ----
+    // "Before Cull" is CPU-known from the queued request and is refreshed every frame.
+    // (In the lazy/reuse path RequestedTotalSplats still holds the current scene's splat count,
+    // since a matching view fingerprint implies an unchanged splat set.)
+    SET_DWORD_STAT(STAT_GaussianSplat_SplatsBeforeCull, static_cast<uint32>(FMath::Max<int32>(0, RequestedTotalSplats)));
+
+    // "After Cull" (visible splats) is a GPU value written by the per-splat cull pass into
+    // VisibleCountBufferRHI. It was copied into an async readback during the previous sort; read
+    // it back now. Lock() blocks until the GPU fence is signaled, so the stat always gets a valid
+    // value (lagging ~1 frame behind the current view).
+    if (VisibleCountReadback && bVisibleCountReadbackPending)
+    {
+        if (void* Data = VisibleCountReadback->Lock(sizeof(uint32)))
+        {
+            const uint32 VisibleSplats = *static_cast<uint32*>(Data);
+            SET_DWORD_STAT(STAT_GaussianSplat_SplatsAfterCull, VisibleSplats);
+        }
+        VisibleCountReadback->Unlock();
+        bVisibleCountReadbackPending = false;
+    }
 
     // A new request was queued for this frame, so execute the GPU cull + sort pipeline now
     // against the current frame's merged static buffers and per-object descriptor buffer.
@@ -187,6 +224,7 @@ bool FGaussianSplatSorter::TryConsumeSorted(
             RHICmdList,
             GlobalPackedPositionSRV,
             GlobalPackedColorSRV,
+            GlobalPackedScaleSRV,
             GlobalChunkPositionMinSRV,
             GlobalChunkPositionMaxSRV,
             GlobalObjectIndexSRV,
@@ -205,7 +243,8 @@ bool FGaussianSplatSorter::TryConsumeSorted(
     }
 
     // No new request was queued. Reuse the last valid GPU result if it still exists.
-    if (!bHasValidSortResult || !SortedIndexPooled.IsValid() || !DrawIndirectArgsPooled.IsValid())
+    if (!bHasValidSortResult || !SortedIndexPooled.IsValid() || !VisibleCountPooled.IsValid()
+        || !DrawIndirectArgsPooled.IsValid())
     {
         return false;
     }
@@ -213,8 +252,10 @@ bool FGaussianSplatSorter::TryConsumeSorted(
     // Re-register the persistent result buffers into the current frame's RDG graph so the
     // raster pass can consume them again without rebuilding the GPU sort.
     FRDGBufferRef SortedIndexBuffer = GraphBuilder.RegisterExternalBuffer(SortedIndexPooled, TEXT("GS_SortedGlobalSplatIndices"));
+    FRDGBufferRef VisibleCountBuffer = GraphBuilder.RegisterExternalBuffer(VisibleCountPooled, TEXT("GS_VisibleSplatCount"));
     FRDGBufferRef DrawIndirectArgsBuffer = GraphBuilder.RegisterExternalBuffer(DrawIndirectArgsPooled, TEXT("GS_SplatDrawIndirectArgs"));
     OutBuffers.SortedIndexSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SortedIndexBuffer, PF_R32_UINT));
+    OutBuffers.VisibleCountSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(VisibleCountBuffer, PF_R32_UINT));
     OutBuffers.DrawIndirectArgsBuffer = DrawIndirectArgsBuffer;
     return true;
 }
@@ -235,13 +276,20 @@ float FGaussianSplatSorter::GetSplatFrustumSlack()
 
 int32 FGaussianSplatSorter::GetSortConfigSignature()
 {
-    return GetCullMode();
+    uint32 Signature = GetTypeHash(GetCullMode());
+    Signature = HashCombine(Signature, GetTypeHash(GaussianSplatCVars::GetScreenSizeCullOnAnyThread()));
+    Signature = HashCombine(Signature, GetTypeHash(GaussianSplatCVars::GetScreenSizeCullMinPixelsOnAnyThread()));
+    Signature = HashCombine(Signature, GetTypeHash(GaussianSplatCVars::GetSortMethodOnRenderThread()));
+    Signature = HashCombine(Signature, GetTypeHash(GaussianSplatCVars::GetDeviceRadixPassCountOnRenderThread()));
+    Signature = HashCombine(Signature, GetTypeHash(GaussianSplatCVars::GetDeviceRadixWriteFinalKeysOnRenderThread()));
+    return static_cast<int32>(Signature);
 }
 
 void FGaussianSplatSorter::UpdateSortFingerprint()
 {
     LastSortedWorldToView = RequestedWorldToView;
     LastSortedViewToClip = RequestedViewToClip;
+    LastSortedMaxFocalLengthPixels = RequestedMaxFocalLengthPixels;
     LastSortedTotalSplats = RequestedTotalSplats;
     LastSortConfigSignature = GetSortConfigSignature();
 }
@@ -265,6 +313,7 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
     FRHICommandListImmediate& RHICmdList,
     const FShaderResourceViewRHIRef& GlobalPackedPositionSRV,
     const FShaderResourceViewRHIRef& GlobalPackedColorSRV,
+    const FShaderResourceViewRHIRef& GlobalPackedScaleSRV,
     const FShaderResourceViewRHIRef& GlobalChunkPositionMinSRV,
     const FShaderResourceViewRHIRef& GlobalChunkPositionMaxSRV,
     const FShaderResourceViewRHIRef& GlobalObjectIndexSRV,
@@ -279,6 +328,7 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
     // All GPU passes in this function operate on the merged global splat stream, so the
     // total splat count and the SRVs for the merged buffers must already be valid.
     if (TotalSplatCount <= 0 || !GlobalPackedPositionSRV.IsValid() || !GlobalPackedColorSRV.IsValid()
+        || !GlobalPackedScaleSRV.IsValid()
         || !GlobalChunkPositionMinSRV.IsValid() || !GlobalChunkPositionMaxSRV.IsValid()
         || !GlobalObjectIndexSRV.IsValid() || !PerObjectSRV.IsValid() || ObjectCount <= 0)
     {
@@ -421,8 +471,7 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
     //    frustum test. Per-splat cull later reuses this buffer as a coarse early-out.
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_ObjectCullCS_RT);
-        SCOPED_GPU_STAT(RHICmdList, GaussianSplatObjectCull);
-        SCOPED_DRAW_EVENTF(RHICmdList, GaussianSplatObjectCull, TEXT("GaussianSplat_ObjectCull(%d)"), ObjectCount);
+        RHI_BREADCRUMB_EVENT_STAT(RHICmdList, GaussianSplatObjectCull, "GaussianSplat_ObjectCull");
         TShaderMapRef<FGaussianObjectCullCS> ComputeShader(ShaderMap);
         FGaussianObjectCullCS::FParameters Parameters;
         Parameters.PerObjectBuffer = PerObjectSRV;
@@ -447,12 +496,12 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
     //    a maximal key so they sort to the tail and are skipped by indirect draw.
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_BuildSortKeysCS_RT);
-        SCOPED_GPU_STAT(RHICmdList, GaussianSplatSortKeyGen);
-        SCOPED_DRAW_EVENTF(RHICmdList, GaussianSplatSortKeyGen, TEXT("GaussianSplat_SortKeyGen(%d)"), TotalSplatCount);
+        RHI_BREADCRUMB_EVENT_STAT(RHICmdList, GaussianSplatSortKeyGen, "GaussianSplat_SortKeyGen");
         TShaderMapRef<FGaussianBuildSortKeysCS> ComputeShader(ShaderMap);
         FGaussianBuildSortKeysCS::FParameters Parameters;
         Parameters.GlobalPackedPositionBuffer = GlobalPackedPositionSRV;
         Parameters.GlobalPackedColorBuffer = GlobalPackedColorSRV;
+        Parameters.GlobalPackedScaleBuffer = GlobalPackedScaleSRV;
         Parameters.GlobalChunkPositionMinBuffer = GlobalChunkPositionMinSRV;
         Parameters.GlobalChunkPositionMaxBuffer = GlobalChunkPositionMaxSRV;
         Parameters.PerObjectBuffer = PerObjectSRV;
@@ -464,6 +513,9 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
         Parameters.TanHalfFovX = RequestedTanHalfFovX;
         Parameters.TanHalfFovY = RequestedTanHalfFovY;
         Parameters.FrustumSlack = GetSplatFrustumSlack();
+        Parameters.EnableScreenSizeCull = GaussianSplatCVars::GetScreenSizeCullOnAnyThread() != 0 ? 1u : 0u;
+        Parameters.ScreenSizeCullMinPixels = GaussianSplatCVars::GetScreenSizeCullMinPixelsOnAnyThread();
+        Parameters.MaxFocalLengthPixels = RequestedMaxFocalLengthPixels;
         Parameters.WorldToView = RequestedWorldToView;
         Parameters.OutDepthKeys = GPUSortKeyUAV[0];
         Parameters.OutVisibleCount = VisibleCountUAV;
@@ -503,36 +555,85 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
     //    stream. The final output is therefore a sorted permutation of global splat indices.
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_SortGPUBuffers_RT);
-        SCOPED_GPU_STAT(RHICmdList, GaussianSplatGPUSort);
-        SCOPED_DRAW_EVENTF(RHICmdList, GaussianSplatGPUSort, TEXT("GaussianSplat_GPUSort(%d)"), TotalSplatCount);
-        FGPUSortBuffers SortBuffers;
-        for (int32 BufferIndex = 0; BufferIndex < 2; ++BufferIndex)
+        bool bUseDeviceRadixSort =
+            GaussianSplatCVars::GetSortMethodOnRenderThread() == 1;
+        if (bUseDeviceRadixSort && !DeviceRadixSort::IsSupported())
         {
-            SortBuffers.RemoteKeySRVs[BufferIndex] = GPUSortKeySRV[BufferIndex];
-            SortBuffers.RemoteKeyUAVs[BufferIndex] = GPUSortKeyUAV[BufferIndex];
-            SortBuffers.RemoteValueSRVs[BufferIndex] = GPUSortValueSRV[BufferIndex];
-            SortBuffers.RemoteValueUAVs[BufferIndex] = GPUSortValueUAV[BufferIndex];
+            UE_LOG(LogTemp, Warning, TEXT("GaussianSplat: DeviceRadixSort requires wave operations on this RHI; falling back to SortGPUBuffers."));
+            bUseDeviceRadixSort = false;
         }
-        SortBuffers.FirstValuesSRV = IdentityIndexSRV;
-        SortBuffers.FinalValuesUAV = SortedIndexUAV;
 
-        RHICmdList.Transition(FRHITransitionInfo(SortBuffers.FinalValuesUAV, ERHIAccess::Unknown, ERHIAccess::SRVCompute));
-        SortGPUBuffers(
-            RHICmdList,
-            SortBuffers,
-            0,
-            0xFFFFFFFFu,
-            TotalSplatCount,
-            GMaxRHIFeatureLevel);
-        RHICmdList.Transition(FRHITransitionInfo(SortBuffers.FinalValuesUAV, ERHIAccess::Unknown, ERHIAccess::SRVMask));
+        if (bUseDeviceRadixSort)
+        {
+            // ---- Tuned DeviceRadixSort path ----
+            // Configurable 8-bit LSD passes with identity-payload generation and an optional
+            // values-only final pass to reduce mobile memory traffic.
+            RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussianSplatDeviceRadixSort, "GaussianSplat_DeviceRadixSort");
+            {
+                FRDGBufferRef RDGKeys[2] = {
+                    GraphBuilder.RegisterExternalBuffer(GPUSortKeyPooled[0], TEXT("GS_DeviceRadixKeys0")),
+                    GraphBuilder.RegisterExternalBuffer(GPUSortKeyPooled[1], TEXT("GS_DeviceRadixKeys1"))
+                };
+                FRDGBufferRef RDGValues[2] = {
+                    GraphBuilder.RegisterExternalBuffer(GPUSortValuePooled[0], TEXT("GS_DeviceRadixValues0")),
+                    GraphBuilder.RegisterExternalBuffer(GPUSortValuePooled[1], TEXT("GS_DeviceRadixValues1"))
+                };
+                FRDGBufferRef RDGSortedIndex = GraphBuilder.RegisterExternalBuffer(SortedIndexPooled, TEXT("GS_DeviceRadixSortedIndex"));
+
+                const uint32 PassCount = static_cast<uint32>(GaussianSplatCVars::GetDeviceRadixPassCountOnRenderThread());
+                DeviceRadixSort::FOptions SortOptions;
+                SortOptions.PassCount = PassCount;
+                SortOptions.FirstBit = 32u - PassCount * 8u;
+                SortOptions.bWriteFinalKeys = GaussianSplatCVars::GetDeviceRadixWriteFinalKeysOnRenderThread() != 0;
+                SortOptions.bFirstPayloadIsIdentity = true;
+
+                DeviceRadixSort::Enqueue(
+                    GraphBuilder,
+                    RDGKeys,
+                    RDGValues,
+                    static_cast<uint32>(TotalSplatCount),
+                    RDGSortedIndex,
+                    nullptr,
+                    &SortOptions);
+
+                // The final downsweep writes values directly to the persistent output buffer.
+            }
+        }
+        else
+        {
+            // ---- UE built-in SortGPUBuffers path ----
+            // This path issues immediate RHI work, so the timing scope has to live on the RHI
+            // timeline as a breadcrumb carrying the stat.
+            RHI_BREADCRUMB_EVENT_STAT(RHICmdList, GaussianSplatGPUSort, "GaussianSplat_UEBuiltinSort");
+
+            FGPUSortBuffers SortBuffers;
+            for (int32 BufferIndex = 0; BufferIndex < 2; ++BufferIndex)
+            {
+                SortBuffers.RemoteKeySRVs[BufferIndex] = GPUSortKeySRV[BufferIndex];
+                SortBuffers.RemoteKeyUAVs[BufferIndex] = GPUSortKeyUAV[BufferIndex];
+                SortBuffers.RemoteValueSRVs[BufferIndex] = GPUSortValueSRV[BufferIndex];
+                SortBuffers.RemoteValueUAVs[BufferIndex] = GPUSortValueUAV[BufferIndex];
+            }
+            SortBuffers.FirstValuesSRV = IdentityIndexSRV;
+            SortBuffers.FinalValuesUAV = SortedIndexUAV;
+
+            RHICmdList.Transition(FRHITransitionInfo(SortBuffers.FinalValuesUAV, ERHIAccess::Unknown, ERHIAccess::SRVCompute));
+            SortGPUBuffers(
+                RHICmdList,
+                SortBuffers,
+                0,
+                0xFFFFFFFFu,
+                TotalSplatCount,
+                GMaxRHIFeatureLevel);
+            RHICmdList.Transition(FRHITransitionInfo(SortBuffers.FinalValuesUAV, ERHIAccess::Unknown, ERHIAccess::SRVMask));
+        }
     }
 
-    // 4. Convert the GPU visible counter into indirect draw args so the raster pass draws
-    //    only the visible prefix of the sorted global splat permutation.
+    // 4. Convert the GPU visible counter into both VS draw args and mesh-dispatch args.
+    //    Both paths consume the same visible prefix of the sorted global permutation.
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_BuildIndirectArgsCS_RT);
-        SCOPED_GPU_STAT(RHICmdList, GaussianSplatIndirectArgs);
-        SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatIndirectArgs);
+        RHI_BREADCRUMB_EVENT_STAT(RHICmdList, GaussianSplatIndirectArgs, "GaussianSplat_IndirectArgs");
         TShaderMapRef<FGaussianBuildIndirectArgsCS> ComputeShader(ShaderMap);
         FGaussianBuildIndirectArgsCS::FParameters Parameters;
         Parameters.VisibleCountBuffer = VisibleCountSRV;
@@ -545,9 +646,31 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
 
     // 5. Re-expose the persistent result buffers as RDG resources for the current frame.
     FRDGBufferRef SortedIndexBuffer = GraphBuilder.RegisterExternalBuffer(SortedIndexPooled, TEXT("GS_SortedGlobalSplatIndices"));
+    FRDGBufferRef VisibleCountBuffer = GraphBuilder.RegisterExternalBuffer(VisibleCountPooled, TEXT("GS_VisibleSplatCount"));
     FRDGBufferRef DrawIndirectArgsBuffer = GraphBuilder.RegisterExternalBuffer(DrawIndirectArgsPooled, TEXT("GS_SplatDrawIndirectArgs"));
     OutBuffers.SortedIndexSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(SortedIndexBuffer, PF_R32_UINT));
+    OutBuffers.VisibleCountSRV = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(VisibleCountBuffer, PF_R32_UINT));
     OutBuffers.DrawIndirectArgsBuffer = DrawIndirectArgsBuffer;
+
+    // Enqueue a non-blocking GPU readback of the visible-splat counter so that
+    // STAT_GaussianSplat_SplatsAfterCull can be populated on a subsequent frame (see
+    // TryConsumeSorted). VisibleCountBufferRHI now holds the count written by the
+    // per-splat cull pass; only re-arm the readback once the previous one was consumed.
+    if (VisibleCountBufferRHI.IsValid() && !bVisibleCountReadbackPending)
+    {
+        if (!VisibleCountReadback)
+        {
+            VisibleCountReadback = new FRHIGPUBufferReadback(TEXT("GS_VisibleCountReadback"));
+        }
+        // VisibleCountUAV is in SRVCompute state (left by the BuildIndirectArgsCS pass).
+        // CopyToStagingBuffer needs the source in CopySrc state, so transition first.
+        RHICmdList.Transition(FRHITransitionInfo(VisibleCountUAV, ERHIAccess::SRVCompute, ERHIAccess::CopySrc));
+        VisibleCountReadback->EnqueueCopy(RHICmdList, VisibleCountBufferRHI, sizeof(uint32));
+        // Restore to SRVCompute so the next frame's transition (Unknown->UAVCompute) works.
+        RHICmdList.Transition(FRHITransitionInfo(VisibleCountUAV, ERHIAccess::CopySrc, ERHIAccess::SRVCompute));
+        bVisibleCountReadbackPending = true;
+    }
+
     return true;
 }
 
@@ -635,7 +758,8 @@ void FGaussianSplatSorter::EnsureDrawIndirectArgsBuffer(FRHICommandListImmediate
         return;
     }
 
-    const uint32 BufferSize = sizeof(FRHIDrawIndirectParameters);
+    static constexpr uint32 IndirectRecordCount = 2u;
+    const uint32 BufferSize = sizeof(FRHIDrawIndirectParameters) * IndirectRecordCount;
     FRHIResourceCreateInfo CreateInfo(TEXT("GS_SplatDrawIndirectArgs"));
     const EBufferUsageFlags UsageFlags =
         EBufferUsageFlags::DrawIndirect |
@@ -645,9 +769,9 @@ void FGaussianSplatSorter::EnsureDrawIndirectArgsBuffer(FRHICommandListImmediate
     DrawIndirectArgsBufferRHI = RHICmdList.CreateVertexBuffer(BufferSize, UsageFlags, CreateInfo);
     DrawIndirectArgsUAV = RHICmdList.CreateUnorderedAccessView(DrawIndirectArgsBufferRHI, PF_R32_UINT);
 
-    FRDGBufferDesc Desc = FRDGBufferDesc::CreateIndirectDesc<FRHIDrawIndirectParameters>(1);
+    FRDGBufferDesc Desc = FRDGBufferDesc::CreateIndirectDesc<FRHIDrawIndirectParameters>(IndirectRecordCount);
     Desc.Usage |= EBufferUsageFlags::UnorderedAccess | EBufferUsageFlags::ShaderResource;
-    DrawIndirectArgsPooled = new FRDGPooledBuffer(TRefCountPtr<FRHIBuffer>(DrawIndirectArgsBufferRHI), Desc, 1, TEXT("GS_SplatDrawIndirectArgs"));
+    DrawIndirectArgsPooled = new FRDGPooledBuffer(TRefCountPtr<FRHIBuffer>(DrawIndirectArgsBufferRHI), Desc, IndirectRecordCount, TEXT("GS_SplatDrawIndirectArgs"));
 }
 
 void FGaussianSplatSorter::ResetGPUSortScratchBuffers()

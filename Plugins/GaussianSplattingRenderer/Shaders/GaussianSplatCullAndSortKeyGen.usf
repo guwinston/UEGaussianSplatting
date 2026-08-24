@@ -8,6 +8,7 @@ static const uint GS_CHUNK_SIZE = 256u;
 StructuredBuffer<uint4> PerObjectBuffer;
 Buffer<uint> GlobalPackedPositionBuffer;
 StructuredBuffer<uint> GlobalPackedColorBuffer;
+StructuredBuffer<uint> GlobalPackedScaleBuffer;
 StructuredBuffer<float4> GlobalChunkPositionMinBuffer;
 StructuredBuffer<float4> GlobalChunkPositionMaxBuffer;
 Buffer<uint> GlobalObjectIndexBuffer;
@@ -26,6 +27,9 @@ int CullMode;
 float TanHalfFovX;
 float TanHalfFovY;
 float FrustumSlack;
+uint EnableScreenSizeCull;
+float ScreenSizeCullMinPixels;
+float MaxFocalLengthPixels;
 float4x4 WorldToView;
 float4x4 ViewToClip;
 
@@ -124,6 +128,16 @@ float3 DecodePackedPosition(uint globalSplatIndex, float3 positionMin, float3 po
 float DecodePackedAlpha(uint packedColor)
 {
     return ((packedColor >> 24u) & 0xffu) / 255.0f;
+}
+
+float3 DecodePackedScale(uint packedScale)
+{
+    const uint scaleX = packedScale & 0xffu;
+    const uint scaleY = (packedScale >> 8u) & 0xffu;
+    const uint scaleZ = (packedScale >> 16u) & 0xffu;
+    static const float FixedLogScaleMin = -10.0f + 4.605170185988091368f;
+    static const float FixedLogScaleStep = 1.0f / 16.0f;
+    return exp(FixedLogScaleMin + float3(scaleX, scaleY, scaleZ) * FixedLogScaleStep);
 }
 
 float3 DecodeGlobalSplatPosition(FObjectDesc obj, uint globalSplatIndex)
@@ -267,19 +281,26 @@ void BuildSortKeysCS(uint3 ThreadId : SV_DispatchThreadID)
         bVisible = false;
     }
 
-    float alpha = DecodePackedAlpha(GlobalPackedColorBuffer[globalSplatIndex]);
-    if (alpha < obj.AlphaCullThreshold)
+    // Alpha threshold and behind-camera rejections are gated by CullMode so that
+    // CullMode == 0 disables ALL filtering (AfterCull == BeforeCull). When CullMode == 0
+    // a behind-camera splat still gets a (wrong but stable) key from -viewPos.z; this is
+    // acceptable because CullMode == 0 is a profiling/debug switch, not a production path.
+    if (CullMode >= 1)
     {
-        // Very low-opacity splats are skipped before sorting to reduce both
-        // overdraw and useless participation in the global depth ordering.
-        bVisible = false;
+        float alpha = DecodePackedAlpha(GlobalPackedColorBuffer[globalSplatIndex]);
+        if (alpha < obj.AlphaCullThreshold)
+        {
+            // Very low-opacity splats are skipped before sorting to reduce both
+            // overdraw and useless participation in the global depth ordering.
+            bVisible = false;
+        }
     }
 
     float3 splatPos = DecodeGlobalSplatPosition(obj, globalSplatIndex);
     float4x4 localToView = mul(obj.LocalToWorld, WorldToView);
     float4 viewPos = mul(float4(splatPos, 1.0f), localToView);
 
-    if (viewPos.z <= 0.0f)
+    if (CullMode >= 1 && viewPos.z <= 0.0f)
     {
         // The current renderer assumes positive forward view-space depth.
         // Splats behind the camera are rejected before key generation.
@@ -295,6 +316,26 @@ void BuildSortKeysCS(uint3 ThreadId : SV_DispatchThreadID)
         float slackTanX = TanHalfFovX * max(FrustumSlack, 1.0f);
         float slackTanY = TanHalfFovY * max(FrustumSlack, 1.0f);
         if (abs(viewPos.x) > viewPos.z * slackTanX || abs(viewPos.y) > viewPos.z * slackTanY)
+        {
+            bVisible = false;
+        }
+    }
+
+    if (bVisible && CullMode >= 1 && EnableScreenSizeCull != 0u && ScreenSizeCullMinPixels > 0.0f)
+    {
+        // Match vk_gaussian_splatting's conservative screen-size test. The
+        // largest decoded axis, object splat scale and instance transform scale
+        // bound the sqrt(8)-sigma ellipse diameter before projection.
+        const float3 decodedScale = DecodePackedScale(GlobalPackedScaleBuffer[globalSplatIndex]);
+        const float maxLocalScale = max(decodedScale.x, max(decodedScale.y, decodedScale.z));
+        const float transformScale = max(
+            length(obj.LocalToWorld[0].xyz),
+            max(length(obj.LocalToWorld[1].xyz), length(obj.LocalToWorld[2].xyz)));
+        const float worldDiameter =
+            maxLocalScale * abs(obj.SplatScale) * transformScale * (2.0f * 2.8284271247461903f);
+        const float projectedDiameterPixels =
+            worldDiameter * max(MaxFocalLengthPixels, 0.0f) / max(abs(viewPos.z), 1.0e-6f);
+        if (projectedDiameterPixels < ScreenSizeCullMinPixels)
         {
             bVisible = false;
         }
@@ -321,16 +362,28 @@ void BuildSortKeysCS(uint3 ThreadId : SV_DispatchThreadID)
 // ------------------------------------------------------------
 // BuildIndirectArgsCS
 //
-// Converts the GPU-side visible splat count into a non-indexed draw-indirect
-// argument buffer. Each splat is rendered as one quad made of two triangles,
-// so each visible splat contributes 6 vertices.
+// Converts the GPU-side visible count into VS draw args at uint[0..3] and
+// mesh dispatch args at uint[4..7]. Both consume the same sorted visible prefix;
+// the mesh path projects 32 splats per workgroup.
 // ------------------------------------------------------------
 [numthreads(1, 1, 1)]
 void BuildIndirectArgsCS(uint3 ThreadId : SV_DispatchThreadID)
 {
     uint visibleCount = VisibleCountBuffer[0];
+
+    // FRHIDrawIndirectParameters at byte offset 0.
     OutDrawIndirectArgs[0] = visibleCount * 6u;
     OutDrawIndirectArgs[1] = 1u;
     OutDrawIndirectArgs[2] = 0u;
     OutDrawIndirectArgs[3] = 0u;
+
+    // Mesh dispatch arguments at byte offset sizeof(FRHIDrawIndirectParameters).
+    // Spread large point clouds over X/Y because each dispatch dimension is limited.
+    const uint splatsPerGroup = 32u;
+    const uint maxGroupsX = 65535u;
+    uint meshGroupCount = (visibleCount + splatsPerGroup - 1u) / splatsPerGroup;
+    OutDrawIndirectArgs[4] = min(meshGroupCount, maxGroupsX);
+    OutDrawIndirectArgs[5] = max(1u, (meshGroupCount + maxGroupsX - 1u) / maxGroupsX);
+    OutDrawIndirectArgs[6] = 1u;
+    OutDrawIndirectArgs[7] = 0u;
 }

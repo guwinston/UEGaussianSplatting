@@ -103,6 +103,8 @@ Buffer<uint>             GlobalObjectIndexBuffer; // N_total uints: global splat
 
 // Draw-order buffer over the global splat list.
 Buffer<uint> SortedVisibleIndexBuffer;
+Buffer<uint> VisibleCountBuffer;
+
 
 // Camera / viewport (shared for all objects in this pass)
 float4x4  WorldToView;
@@ -402,12 +404,14 @@ void ClipOccludedPixel(float PixelZ, float SceneZ)
 // ============================================================
 struct FVSOutput
 {
-    float4 Position      : SV_Position;
-    nointerpolation float4 SplatColor   : COLOR0;      // RGB in asset color space + sigmoid opacity
-    float2 FragPos       : TEXCOORD0;   // Local parameter coords in [-sqrt8, +sqrt8]
-    nointerpolation float2 ScreenCenter : TEXCOORD1;   // Splat center in pixel coords (viewport-relative)
-    nointerpolation float3 Conic        : TEXCOORD2;   // Inverse 2D covariance: (xx, xy, yy)
-    nointerpolation float3 CenterViewPos : TEXCOORD3;         // Gaussian center position in view space, shared across the whole billboard quad.
+    float4 Position : SV_Position;
+    nointerpolation float4 SplatColor : COLOR0;
+#if RASTER_MODE == 0
+    float2 FragPos : TEXCOORD0;
+#else
+    nointerpolation float2 ScreenCenter : TEXCOORD0;
+    nointerpolation float3 Conic : TEXCOORD1;
+#endif
 };
 
 FVSOutput MakeInvalidOutput()
@@ -415,18 +419,19 @@ FVSOutput MakeInvalidOutput()
     FVSOutput Out;
     Out.Position = float4(0, 0, 2, 1);
     Out.SplatColor = float4(0, 0, 0, 0);
+#if RASTER_MODE == 0
     Out.FragPos = float2(0, 0);
+#else
     Out.ScreenCenter = float2(0, 0);
     Out.Conic = float3(0, 0, 0);
-    Out.CenterViewPos = float3(0, 0, 0);
+#endif
     return Out;
 }
 
-// Quad corners in the Gaussian's local parameter space: a square over [-1, 1]^2
-// is rasterized first, then the pixel shader keeps only the inscribed sqrt(8)-radius circle.
+// Quad corners in the Gaussian's local parameter space.
 static const float2 QUAD_CORNERS[6] = {
     float2(-1,-1), float2(1,-1), float2(1,1),
-    float2(-1,-1), float2(1, 1), float2(-1,1)
+    float2(-1,-1), float2(1,1), float2(-1,1)
 };
 
 // ============================================================
@@ -570,17 +575,185 @@ FVSOutput GaussianSplatVS(uint VertexID : SV_VertexID)
     float2 screenCenter = float2(0,0);
 #endif
 
-    Out.Position     = float4(ndcCenter.xy + ndcOffset, ndcCenter.z, 1.0f);
-    Out.SplatColor   = splatColor;
-    // Use sqrt(8) sigma as the local-space ellipse extent here (the original 3DGS uses 3 sigma).
-    // In this normalized Gaussian local space, the standard deviation is 1 on each axis.
-    Out.FragPos      = corner * gaussianExtent;
+    Out.Position = float4(ndcCenter.xy + ndcOffset, ndcCenter.z, 1.0f);
+    Out.SplatColor = splatColor;
+#if RASTER_MODE == 0
+    Out.FragPos = corner * gaussianExtent;
+#else
     Out.ScreenCenter = screenCenter;
-    Out.Conic        = conic;
-    Out.CenterViewPos = vCenter.xyz;
+    Out.Conic = conic;
+#endif
 
     return Out;
 }
+
+#if MESHSHADER
+
+// ============================================================
+// MESH SHADER
+//
+// One thread projects one sorted Gaussian, then exports the four unique
+// billboard vertices and two triangles. The VS fallback above performs the
+// same projection once per generated vertex (six times per Gaussian).
+// ============================================================
+static const float2 MESH_QUAD_CORNERS[4] = {
+    float2(-1,-1), float2(1,-1), float2(1,1), float2(-1,1)
+};
+
+MESH_SHADER_TRIANGLE_ATTRIBUTES(32)
+void GaussianSplatMS(
+    uint GroupThreadID : SV_GroupThreadID,
+    uint3 GroupID : SV_GroupID,
+    MESH_SHADER_VERTEX_EXPORT(FVSOutput, 128),
+    MESH_SHADER_TRIANGLE_EXPORT(64)
+)
+{
+    const uint visibleCount = VisibleCountBuffer[0];
+    const uint linearGroupIndex = GroupID.x + GroupID.y * 65535u;
+    const uint groupSplatOffset = linearGroupIndex * 32u;
+    const uint remainingSplats = visibleCount > groupSplatOffset
+        ? visibleCount - groupSplatOffset
+        : 0u;
+    const uint activeSplatCount = min(32u, remainingSplats);
+
+    SetMeshOutputCounts(activeSplatCount * 4u, activeSplatCount * 2u);
+
+    if (GroupThreadID >= activeSplatCount)
+    {
+        return;
+    }
+
+    FVSOutput ProjectedVertices[4];
+    [unroll]
+    for (uint InitVertex = 0u; InitVertex < 4u; ++InitVertex)
+    {
+        ProjectedVertices[InitVertex] = MakeInvalidOutput();
+    }
+
+    const uint visibleIndex = groupSplatOffset + GroupThreadID;
+    const uint globalIdx = SortedVisibleIndexBuffer[visibleIndex];
+
+    if (globalIdx < (uint)TotalSplatCount)
+    {
+        const uint objectIndex = GlobalObjectIndexBuffer[globalIdx];
+        if (objectIndex < (uint)ObjectCount)
+        {
+            FObjectDesc obj = LoadObjectDesc(objectIndex);
+            const uint splatIdx = globalIdx - obj.SplatOffset;
+            float3 splatPos = DecodeGlobalSplatPosition(obj, globalIdx, splatIdx);
+            float4 splatColor = DecodePackedColor(obj, GlobalPackedColorBuffer[globalIdx]);
+
+            if (splatColor.a >= obj.AlphaCullThreshold)
+            {
+                float4x4 MV = mul(obj.LocalToWorld, WorldToView);
+                float4 vCenter = mul(float4(splatPos, 1.0f), MV);
+
+                if (vCenter.z >= 0.01f)
+                {
+                    float4 clipCenter = mul(vCenter, ViewToClip);
+                    const float clipW = clipCenter.w;
+
+                    if (clipW > 0.0f)
+                    {
+                        clipCenter.z = clamp(clipCenter.z, 0.0f, clipW);
+                        int maxSHDeg = (int)obj.MaxSHDegree;
+                        if (maxSHDeg > 0)
+                        {
+                            float3 localCamPos = mul(float4(CameraPosition, 1.0f), obj.WorldToLocal).xyz;
+                            float3 viewDirUE = normalize(splatPos - localCamPos);
+                            float3 viewDir3DGS = float3(viewDirUE.y, -viewDirUE.z, viewDirUE.x);
+                            float3 sh1[3], sh2[5], sh3[7];
+                            FetchSHGlobal(globalIdx, obj, maxSHDeg, sh1, sh2, sh3);
+                            splatColor.rgb += EvaluateSH(viewDir3DGS, maxSHDeg, sh1, sh2, sh3);
+                        }
+                        splatColor.rgb = max(splatColor.rgb, float3(0,0,0));
+
+                        float4 rotationQuat = DecodePackedQuaternion(GlobalPackedRotationBuffer[globalIdx]);
+                        float3 scale = DecodeGlobalSplatScale(obj, globalIdx, splatIdx);
+                        float3x3 cov3D = BuildCovariance3D(rotationQuat, scale);
+                        float3 cov2D = ProjectCovariance2D(cov3D, vCenter, FocalLength, ViewportSize, MV);
+
+                        float detBeforeFilter = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
+                        cov2D.x += 0.1f;
+                        cov2D.z += 0.1f;
+                        float detAfterFilter = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
+                        if (EnableAntialiasing != 0u && detBeforeFilter > 0.0f && detAfterFilter > 0.0f)
+                        {
+                            splatColor.a *= sqrt(max(0.000025f, detBeforeFilter / detAfterFilter));
+                        }
+
+#if RASTER_MODE == 1
+                        float3 conic;
+                        bool bValidConic = ComputeConicFromCovariance(cov2D, conic);
+#else
+                        float3 conic = float3(0,0,0);
+                        bool bValidConic = true;
+#endif
+
+                        float2 bv1 = float2(0,0);
+                        float2 bv2 = float2(0,0);
+                        float opacity = splatColor.a;
+                        float gaussianExtent = SQRT8;
+                        if (EnableOpacityAwareBounds != 0u)
+                        {
+                            const float alphaThreshold = 1.0f / 255.0f;
+                            gaussianExtent = min(
+                                SQRT8,
+                                sqrt(max(0.0f, 2.0f * log(max(opacity, alphaThreshold) / alphaThreshold))));
+                        }
+
+                        const bool bValidExtent = ComputeProjectedExtentBasis(
+                            cov2D, gaussianExtent, obj.SplatScale, opacity, bv1, bv2);
+
+                        if (bValidConic && bValidExtent)
+                        {
+                            splatColor.a = opacity;
+                            const float3 ndcCenter = clipCenter.xyz / clipW;
+#if RASTER_MODE == 1
+                            float2 screenCenter;
+                            screenCenter.x = ViewportMin.x + (ndcCenter.x * 0.5f + 0.5f) * ViewportSize.x;
+                            screenCenter.y = ViewportMin.y + (0.5f - ndcCenter.y * 0.5f) * ViewportSize.y;
+#else
+                            float2 screenCenter = float2(0,0);
+#endif
+                            [unroll]
+                            for (uint CornerIndex = 0u; CornerIndex < 4u; ++CornerIndex)
+                            {
+                                const float2 corner = MESH_QUAD_CORNERS[CornerIndex];
+                                const float2 pixelOffset = corner.x * bv1 + corner.y * bv2;
+                                const float2 ndcOffset = pixelOffset * float2(2.0f, -2.0f) / ViewportSize;
+
+                                FVSOutput Out;
+                                Out.Position = float4(ndcCenter.xy + ndcOffset, ndcCenter.z, 1.0f);
+                                Out.SplatColor = splatColor;
+#if RASTER_MODE == 0
+                                Out.FragPos = corner * gaussianExtent;
+#else
+                                Out.ScreenCenter = screenCenter;
+                                Out.Conic = conic;
+#endif
+                                ProjectedVertices[CornerIndex] = Out;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const uint vertexBase = GroupThreadID * 4u;
+    [unroll]
+    for (uint VertexOffset = 0u; VertexOffset < 4u; ++VertexOffset)
+    {
+        MESH_SHADER_WRITE_VERTEX(vertexBase + VertexOffset, ProjectedVertices[VertexOffset]);
+    }
+
+    const uint primitiveBase = GroupThreadID * 2u;
+    MESH_SHADER_WRITE_TRIANGLE(primitiveBase + 0u, uint3(vertexBase + 0u, vertexBase + 1u, vertexBase + 2u));
+    MESH_SHADER_WRITE_TRIANGLE(primitiveBase + 1u, uint3(vertexBase + 0u, vertexBase + 2u, vertexBase + 3u));
+}
+
+#endif // MESHSHADER
 
 // ============================================================
 // PIXEL SHADER
@@ -606,7 +779,7 @@ float4 GaussianSplatPS(FVSOutput In) : SV_Target0
     if (power > 0.0f) discard;
     float gaussianWeight = exp(power);
 #else
-    float2 fp = In.FragPos;
+    const float2 fp = In.FragPos;
     float A   = dot(fp, fp);
     if (A > 8.0f) discard;
     float gaussianWeight = exp(-0.5f * A);

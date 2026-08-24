@@ -45,6 +45,15 @@ public class GaussianSplatting : ModuleRules
             Path.Combine(EngineDirectory, "Source/Runtime/Renderer/Internal"),
         });
 
+        // Register the Android UPL so the generated manifest does not request
+        // deprecated storage permissions during Development startup.
+        if (Target.Platform == UnrealTargetPlatform.Android)
+        {
+            AdditionalPropertiesForReceipt.Add(
+                "AndroidPlugin",
+                Path.Combine(ModuleDirectory, "GaussianSplattingRenderer_UPL_Android.xml"));
+        }
+
         // Enable C++20 for std::atomic and threading primitives used in GaussianSplatSorter
         // (UE's FRunnable, FEvent already handle cross-platform threading)
         bUseUnity = false;  // Disable unity build to ensure all files are compiled individually

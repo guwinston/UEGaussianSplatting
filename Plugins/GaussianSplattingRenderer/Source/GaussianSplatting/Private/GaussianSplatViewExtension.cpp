@@ -11,7 +11,6 @@
 #include "PipelineStateCache.h"
 #include "RHIStaticStates.h"
 #include "RHICommandList.h"
-#include "DataDrivenShaderPlatformInfo.h"
 #include "CommonRenderResources.h"       // GEmptyVertexDeclaration
 #include "ShaderParameterUtils.h"
 #include "PostProcess/PostProcessInputs.h"   // FPostProcessingInputs
@@ -456,19 +455,26 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
     if (!ShaderMap) return;
 
+
     FGaussianSplatVS::FPermutationDomain VsPerm;
+    FGaussianSplatMS::FPermutationDomain MsPerm;
     FGaussianSplatPS::FPermutationDomain PsPerm;
     TShaderMapRef<FGaussianSplatVS> VertexShader(ShaderMap, FGaussianSplatVS::FPermutationDomain{});
+    TShaderRef<FGaussianSplatMS> MeshShader;
     TShaderMapRef<FGaussianSplatPS> PixelShader(ShaderMap, FGaussianSplatPS::FPermutationDomain{});
     TShaderMapRef<FGaussianSplatCompositeVS> CompositeVertexShader(ShaderMap);
     TShaderMapRef<FGaussianSplatCompositePS> CompositePixelShader(ShaderMap);
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_SetupShaders_CPU);
         VsPerm.Set<FGaussianSplatRasterModeDim>(RasterMode);
-
+        MsPerm.Set<FGaussianSplatRasterModeDim>(RasterMode);
         PsPerm.Set<FGaussianSplatRasterModeDim>(RasterMode);
 
         VertexShader = TShaderMapRef<FGaussianSplatVS>(ShaderMap, VsPerm);
+        if (GRHISupportsMeshShadersTier0)
+        {
+            MeshShader = TShaderMapRef<FGaussianSplatMS>(ShaderMap, MsPerm);
+        }
         PixelShader = TShaderMapRef<FGaussianSplatPS>(ShaderMap, PsPerm);
         CompositeVertexShader = TShaderMapRef<FGaussianSplatCompositeVS>(ShaderMap);
         CompositePixelShader = TShaderMapRef<FGaussianSplatCompositePS>(ShaderMap);
@@ -478,6 +484,10 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     {
         return;
     }
+    const int32 GeometryMode = GaussianSplatCVars::GetGeometryModeOnRenderThread();
+    const bool bUseMeshShader = GeometryMode == 1
+        && GRHISupportsMeshShadersTier0
+        && MeshShader.IsValid();
 
     // 2. Camera / viewport
     const FMatrix44d& ViewMatrix = InView.ViewMatrices.GetViewMatrix();
@@ -596,6 +606,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
             ViewToClip,
             TanHalfFovX,
             TanHalfFovY,
+            FMath::Max(FMath::Abs(FX), FMath::Abs(FY)),
             TotalSplats,
             /*bLazy=*/!bRebuiltStaticBuffers && !bForceSortEveryFrame);
     }
@@ -607,6 +618,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     FRHICommandListImmediate& RHICmdListNow = GraphBuilder.RHICmdList;
     FRDGBufferSRVRef PerObjSRV;
     FRDGBufferSRVRef SortedIndexSRV;
+    FRDGBufferSRVRef VisibleCountSRV;
     FRDGBufferSRVRef PackedPosSRV;
     FRDGBufferSRVRef PackedColorSRV;
     FRDGBufferSRVRef PackedRotationSRV;
@@ -671,6 +683,9 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
             FShaderResourceViewRHIRef ColorRHISRV = RHICmdListNow.CreateShaderResourceView(
                 StaticPackedColorPooled->GetRHI(),
                 FRHIViewDesc::CreateBufferSRV().SetType(FRHIViewDesc::EBufferType::Structured));
+            FShaderResourceViewRHIRef ScaleRHISRV = RHICmdListNow.CreateShaderResourceView(
+                StaticPackedScalePooled->GetRHI(),
+                FRHIViewDesc::CreateBufferSRV().SetType(FRHIViewDesc::EBufferType::Structured));
             FShaderResourceViewRHIRef ChunkPositionMinRHISRV = RHICmdListNow.CreateShaderResourceView(
                 StaticChunkPositionMinPooled->GetRHI(),
                 FRHIViewDesc::CreateBufferSRV().SetType(FRHIViewDesc::EBufferType::Structured));
@@ -687,6 +702,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
                 RHICmdListNow,
                 PositionRHISRV,
                 ColorRHISRV,
+                ScaleRHISRV,
                 ChunkPositionMinRHISRV,
                 ChunkPositionMaxRHISRV,
                 ObjectIndexRHISRV,
@@ -698,6 +714,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
             }
 
             SortedIndexSRV = SortBuffers.SortedIndexSRV;
+            VisibleCountSRV = SortBuffers.VisibleCountSRV;
             DrawIndirectArgsBuffer = SortBuffers.DrawIndirectArgsBuffer;
 
             if (StaticPackedSHDataPooled.IsValid() && StaticSHCodebookPooled.IsValid())
@@ -726,7 +743,8 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
             AddClearRenderTargetPass(GraphBuilder, GaussianAccumTexture, FLinearColor::Transparent, ViewRect);
         }
     }
-    if (!SortedIndexSRV || !DrawIndirectArgsBuffer) return;
+    if (!SortedIndexSRV || !VisibleCountSRV || !DrawIndirectArgsBuffer) return;
+
 
     const FViewInfo* ViewInfo = InView.bIsViewInfo ? &static_cast<const FViewInfo&>(InView) : nullptr;
     const FIntRect SceneDepthViewRect = ViewInfo ? ViewInfo->ViewRect : ViewRect;
@@ -763,6 +781,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         PassParams->VS.GlobalObjectIndexBuffer = ObjectIndexSRV;
         PassParams->VS.PerObjectBuffer        = PerObjSRV;
         PassParams->VS.SortedVisibleIndexBuffer = SortedIndexSRV;
+        PassParams->VS.VisibleCountBuffer = VisibleCountSRV;
         PassParams->DrawIndirectArgsBuffer = DrawIndirectArgsBuffer;
 
         PassParams->VS.WorldToView      = WorldToView;
@@ -795,13 +814,14 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         }
     }
 
+    const TCHAR* GeometryBackendName = bUseMeshShader ? TEXT("MS") : TEXT("VS");
     auto AddMainSplatPass = [&](const TCHAR* PassName)
     {
         GraphBuilder.AddPass(
-            RDG_EVENT_NAME("%s", PassName),
+            RDG_EVENT_NAME("%s_%s", PassName, GeometryBackendName),
             PassParams,
             ERDGPassFlags::Raster,
-            [VertexShader, PixelShader, PassParams, VMinX, VMinY, VMaxX, VMaxY, bCompositeToUELinear, bUseManualSceneDepthTest, bHasSceneDepth = (SceneDepthTexture != nullptr)]
+            [VertexShader, MeshShader, PixelShader, PassParams, VMinX, VMinY, VMaxX, VMaxY, bCompositeToUELinear, bUseManualSceneDepthTest, bUseMeshShader, bHasSceneDepth = (SceneDepthTexture != nullptr)]
             (FRHICommandList& RHICmdList)
             {
                 FGraphicsPipelineStateInitializer PSOInit;
@@ -832,17 +852,40 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
                 }
                 PSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
 
-                PSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
-                PSOInit.BoundShaderState.VertexShaderRHI      = VertexShader.GetVertexShader();
-                PSOInit.BoundShaderState.PixelShaderRHI       = PixelShader.GetPixelShader();
+                if (bUseMeshShader)
+                {
+                    PSOInit.BoundShaderState.SetMeshShader(MeshShader.GetMeshShader());
+                }
+                else
+                {
+                    PSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+                    PSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
+                }
+                PSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
                 PSOInit.PrimitiveType = PT_TriangleList;
 
                 SetGraphicsPipelineState(RHICmdList, PSOInit, 0);
 
                 RHICmdList.SetViewport(VMinX, VMinY, 0.0f, VMaxX, VMaxY, 1.0f);
-                SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), PassParams->VS);
+                if (bUseMeshShader)
+                {
+                    SetShaderParameters(RHICmdList, MeshShader, MeshShader.GetMeshShader(), PassParams->VS);
+                }
+                else
+                {
+                    SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), PassParams->VS);
+                }
                 SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PassParams->PS);
-                RHICmdList.DrawPrimitiveIndirect(PassParams->DrawIndirectArgsBuffer->GetIndirectRHICallBuffer(), 0);
+                if (bUseMeshShader)
+                {
+                    RHICmdList.DispatchIndirectMeshShader(
+                        PassParams->DrawIndirectArgsBuffer->GetIndirectRHICallBuffer(),
+                        sizeof(FRHIDrawIndirectParameters));
+                }
+                else
+                {
+                    RHICmdList.DrawPrimitiveIndirect(PassParams->DrawIndirectArgsBuffer->GetIndirectRHICallBuffer(), 0);
+                }
             }
         );
     };

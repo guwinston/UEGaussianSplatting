@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  GaussianSplattingRenderer_UPL_Android.xml
+
+  Android UPL for the GaussianSplattingRenderer plugin.
+
+  Problem:
+  - UE 5.4 in Development (and sometimes Shipping) configuration always adds
+    WRITE_EXTERNAL_STORAGE to the manifest meta-data tag
+    `com.epicgames.unreal.GameActivity.StartupPermissions`, and also declares
+    READ/WRITE_EXTERNAL_STORAGE as <uses-permission> in AndroidManifest.xml.
+  - SplashActivity reads StartupPermissions on launch and calls
+    requestPermissions() for each entry. On Android 13+ (API 33+), these
+    permissions are deprecated under Scoped Storage, so the request is
+    silently DENIED and SplashActivity falls back to showDialog(...) showing
+    a "Permissions Required / No Storage Permission" UI with only
+    Quit / Settings buttons - and Android 16 hides the storage permission
+    entry from the per-app permission settings, so the user has no way to
+    satisfy the request.
+
+  Fix:
+  1. Empty the `StartupPermissions` meta-data value so SplashActivity
+     does not request any dangerous permission at startup. The project
+     already sets bUseExternalFilesDir=true in DefaultEngine.ini, so all
+     game data lives in /sdcard/Android/data/<package>/files/, which is
+     app-private and needs no runtime permission on any Android version.
+  2. Remove READ/WRITE_EXTERNAL_STORAGE <uses-permission> declarations
+     from the manifest entirely. They are useless on API 33+ and trigger
+     Play Console warnings on upload.
+
+  Screen orientation and application debuggability intentionally remain
+  project/build-configuration concerns and are not overridden by this plugin.
+-->
+<root xmlns:android="http://schemas.android.com/apk/res/android">
+	<init>
+		<log text="GaussianSplattingRenderer UPL: Clearing StartupPermissions and removing legacy storage permissions (Android 13+ scoped storage / app-private files dir)."/>
+	</init>
+
+	<androidManifestUpdates>
+		<!-- 1) Empty the StartupPermissions meta-data value so SplashActivity
+		     does not request any dangerous permission at startup. -->
+		<loopElements tag="meta-data">
+			<setStringFromAttribute result="metaName" tag="$" name="android:name"/>
+			<setBoolIsEqual result="bIsStartup" arg1="$S(metaName)" arg2="com.epicgames.unreal.GameActivity.StartupPermissions"/>
+			<if condition="bIsStartup">
+				<true>
+					<addAttribute tag="$" name="android:value" value=""/>
+					<log text="GaussianSplattingRenderer UPL: Cleared StartupPermissions value."/>
+				</true>
+			</if>
+		</loopElements>
+
+		<!-- 2) Remove the deprecated storage permission declarations. -->
+		<removePermission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
+		<removePermission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
+
+	</androidManifestUpdates>
+</root>

@@ -1,0 +1,232 @@
+// Android Vulkan fallback for drivers that advertise subgroup operations but fail to
+// create DeviceRadix compute pipelines containing wave intrinsics. This keeps the same
+// stable 8-bit LSD radix topology while using only workgroup barriers, LDS atomics and
+// integer operations.
+
+#define MOBILE_SAFE_MASK_WORDS       (D_DIM / 32U)
+#define MOBILE_SAFE_MASK_COUNT       (RADIX * MOBILE_SAFE_MASK_WORDS)
+#define MOBILE_SAFE_BUCKET_BASE      MOBILE_SAFE_MASK_COUNT
+
+groupshared uint g_mobileScanCarry;
+groupshared uint g_mobileScanChunkTotal;
+
+inline void MobileSafeExclusiveScan256(uint gtid)
+{
+    [unroll]
+    for (uint offset = 1U; offset < RADIX; offset <<= 1U)
+    {
+        const uint index = (gtid + 1U) * offset * 2U - 1U;
+        if (index < RADIX)
+        {
+            g_us[RADIX + index] += g_us[RADIX + index - offset];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gtid == 0U)
+    {
+        g_us[RADIX * 2U - 1U] = 0U;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint offset = RADIX >> 1U; offset > 0U; offset >>= 1U)
+    {
+        const uint index = (gtid + 1U) * offset * 2U - 1U;
+        if (index < RADIX)
+        {
+            const uint left = g_us[RADIX + index - offset];
+            g_us[RADIX + index - offset] = g_us[RADIX + index];
+            g_us[RADIX + index] += left;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+[numthreads(US_DIM, 1, 1)]
+void Upsweep(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    const uint gtid = groupThreadId.x;
+    const uint gid = groupId.x;
+
+    for (uint digit = gtid; digit < RADIX; digit += US_DIM)
+    {
+        g_us[digit] = 0U;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint partitionBegin = gid * PART_SIZE;
+    const uint partitionEnd = min(partitionBegin + PART_SIZE, e_numKeys);
+    for (uint index = partitionBegin + gtid; index < partitionEnd; index += US_DIM)
+    {
+        InterlockedAdd(g_us[ExtractDigit(b_sort[index])], 1U);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint digit = gtid; digit < RADIX; digit += US_DIM)
+    {
+        g_us[RADIX + digit] = g_us[digit];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    MobileSafeExclusiveScan256(gtid);
+
+    for (uint digit = gtid; digit < RADIX; digit += US_DIM)
+    {
+        b_passHist[digit * e_threadBlocks + gid] = g_us[digit];
+        InterlockedAdd(
+            b_globalHist[GlobalHistOffset() + digit],
+            g_us[RADIX + digit]);
+    }
+}
+
+inline void MobileSafeExclusiveScan128(uint gtid)
+{
+    [unroll]
+    for (uint offset = 1U; offset < SCAN_DIM; offset <<= 1U)
+    {
+        const uint index = (gtid + 1U) * offset * 2U - 1U;
+        if (index < SCAN_DIM)
+        {
+            g_scan[index] += g_scan[index - offset];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gtid == 0U)
+    {
+        g_mobileScanChunkTotal = g_scan[SCAN_DIM - 1U];
+        g_scan[SCAN_DIM - 1U] = 0U;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint offset = SCAN_DIM >> 1U; offset > 0U; offset >>= 1U)
+    {
+        const uint index = (gtid + 1U) * offset * 2U - 1U;
+        if (index < SCAN_DIM)
+        {
+            const uint left = g_scan[index - offset];
+            g_scan[index - offset] = g_scan[index];
+            g_scan[index] += left;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+[numthreads(SCAN_DIM, 1, 1)]
+void Scan(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    const uint gtid = groupThreadId.x;
+    const uint digitOffset = groupId.x * e_threadBlocks;
+
+    if (gtid == 0U)
+    {
+        g_mobileScanCarry = 0U;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint partitionBase = 0U; partitionBase < e_threadBlocks; partitionBase += SCAN_DIM)
+    {
+        const uint partition = partitionBase + gtid;
+        g_scan[gtid] = partition < e_threadBlocks
+            ? b_passHist[digitOffset + partition]
+            : 0U;
+        GroupMemoryBarrierWithGroupSync();
+
+        MobileSafeExclusiveScan128(gtid);
+
+        if (partition < e_threadBlocks)
+        {
+            b_passHist[digitOffset + partition] = g_mobileScanCarry + g_scan[gtid];
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        if (gtid == 0U)
+        {
+            g_mobileScanCarry += g_mobileScanChunkTotal;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+[numthreads(D_DIM, 1, 1)]
+void Downsweep(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    const uint gtid = groupThreadId.x;
+    const uint gid = groupId.x;
+
+    for (uint index = gtid; index < MOBILE_SAFE_MASK_COUNT; index += D_DIM)
+    {
+        g_d[index] = 0U;
+    }
+    g_d[MOBILE_SAFE_BUCKET_BASE + gtid] = 0U;
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint iteration = 0U; iteration < KEYS_PER_THREAD; ++iteration)
+    {
+        const uint deviceIndex = gid * PART_SIZE + iteration * D_DIM + gtid;
+        const bool valid = deviceIndex < e_numKeys;
+        const uint key = valid ? b_sort[deviceIndex] : 0xffffffffU;
+        const uint digit = ExtractDigit(key);
+
+        if (valid)
+        {
+            const uint maskIndex = digit * MOBILE_SAFE_MASK_WORDS + (gtid >> 5U);
+            InterlockedOr(g_d[maskIndex], 1U << (gtid & 31U));
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        if (valid)
+        {
+            const uint wordIndex = gtid >> 5U;
+            uint localRank = g_d[MOBILE_SAFE_BUCKET_BASE + digit];
+            [unroll]
+            for (uint word = 0U; word < MOBILE_SAFE_MASK_WORDS; ++word)
+            {
+                if (word < wordIndex)
+                {
+                    localRank += countbits(g_d[digit * MOBILE_SAFE_MASK_WORDS + word]);
+                }
+            }
+            const uint lowerMask = (1U << (gtid & 31U)) - 1U;
+            localRank += countbits(g_d[digit * MOBILE_SAFE_MASK_WORDS + wordIndex] & lowerMask);
+
+            const uint outputIndex =
+                b_globalHist[GlobalHistOffset() + digit] +
+                b_passHist[digit * e_threadBlocks + gid] +
+                localRank;
+
+#if DEVICE_RADIX_WRITE_KEYS
+            b_alt[outputIndex] = key;
+#endif
+
+#if DEVICE_RADIX_IDENTITY_PAYLOAD
+            b_altPayload[outputIndex] = deviceIndex;
+#else
+            b_altPayload[outputIndex] = b_sortPayload[deviceIndex];
+#endif
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        uint bucketCount = 0U;
+        [unroll]
+        for (uint word = 0U; word < MOBILE_SAFE_MASK_WORDS; ++word)
+        {
+            bucketCount += countbits(g_d[gtid * MOBILE_SAFE_MASK_WORDS + word]);
+        }
+        g_d[MOBILE_SAFE_BUCKET_BASE + gtid] += bucketCount;
+        GroupMemoryBarrierWithGroupSync();
+
+        for (uint index = gtid; index < MOBILE_SAFE_MASK_COUNT; index += D_DIM)
+        {
+            g_d[index] = 0U;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+#undef MOBILE_SAFE_BUCKET_BASE
+#undef MOBILE_SAFE_MASK_COUNT
+#undef MOBILE_SAFE_MASK_WORDS

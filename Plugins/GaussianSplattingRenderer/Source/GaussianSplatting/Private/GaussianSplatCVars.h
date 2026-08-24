@@ -10,8 +10,17 @@ namespace GaussianSplatCVars
     int32 GetUseNoAAProjectionOnRenderThread();
     int32 GetEnableAntialiasingOnRenderThread();
     int32 GetOpacityAwareBoundsOnRenderThread();
+    /** Geometry backend: 0 = VS+PS, 1 = MS+PS (falls back to VS when unsupported). */
+    int32 GetGeometryModeOnRenderThread();
 
     int32 GetCullModeOnAnyThread();
     int32 GetForceSortEveryFrameOnAnyThread();
     float GetSplatFrustumSlackOnAnyThread();
+    int32 GetScreenSizeCullOnAnyThread();
+    float GetScreenSizeCullMinPixelsOnAnyThread();
+
+    /** GPU sort method: 0 = UE built-in, 1 = DeviceRadix8. */
+    int32 GetSortMethodOnRenderThread();
+    int32 GetDeviceRadixPassCountOnRenderThread();
+    int32 GetDeviceRadixWriteFinalKeysOnRenderThread();
 }

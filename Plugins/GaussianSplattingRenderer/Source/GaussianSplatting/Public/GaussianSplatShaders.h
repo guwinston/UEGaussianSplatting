@@ -8,7 +8,6 @@
 #include "RHICommandList.h"
 #include "ShaderPermutation.h"
 #include "SceneView.h"
-#include "DataDrivenShaderPlatformInfo.h"
 
 // ============================================================
 //  GPU Object Cull Compute Shader
@@ -59,6 +58,7 @@ class GAUSSIANSPLATTING_API FGaussianBuildSortKeysCS : public FGlobalShader
     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
         SHADER_PARAMETER_SRV(Buffer<uint>, GlobalPackedPositionBuffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<uint>, GlobalPackedColorBuffer)
+        SHADER_PARAMETER_SRV(StructuredBuffer<uint>, GlobalPackedScaleBuffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, GlobalChunkPositionMinBuffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, GlobalChunkPositionMaxBuffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<uint4>, PerObjectBuffer)
@@ -70,6 +70,9 @@ class GAUSSIANSPLATTING_API FGaussianBuildSortKeysCS : public FGlobalShader
         SHADER_PARAMETER(float, TanHalfFovX)
         SHADER_PARAMETER(float, TanHalfFovY)
         SHADER_PARAMETER(float, FrustumSlack)
+        SHADER_PARAMETER(uint32, EnableScreenSizeCull)
+        SHADER_PARAMETER(float, ScreenSizeCullMinPixels)
+        SHADER_PARAMETER(float, MaxFocalLengthPixels)
         SHADER_PARAMETER(FMatrix44f, WorldToView)
         SHADER_PARAMETER_UAV(RWBuffer<uint32>, OutDepthKeys)
         SHADER_PARAMETER_UAV(RWBuffer<uint32>, OutVisibleCount)
@@ -205,6 +208,7 @@ class GAUSSIANSPLATTING_API FGaussianSplatVS : public FGlobalShader
 
         SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, PerObjectBuffer)
         SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SortedVisibleIndexBuffer)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, VisibleCountBuffer)
 
         SHADER_PARAMETER(FMatrix44f, WorldToView)
         SHADER_PARAMETER(FMatrix44f, ViewToClip)
@@ -226,9 +230,33 @@ class GAUSSIANSPLATTING_API FGaussianSplatVS : public FGlobalShader
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {
         // This desktop VS reads several buffer SRVs. Android Mobile Vulkan
-        // explicitly disables vertex-shader SRVs, so its replacement backend
-        // must use a compute-generated instance stream instead.
+        // explicitly disables vertex-shader SRVs.
         return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+
+    static void ModifyCompilationEnvironment(
+        const FGlobalShaderPermutationParameters& Parameters,
+        FShaderCompilerEnvironment& OutEnvironment)
+    {
+        FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+    }
+};
+
+// ============================================================
+//  3DGS Direct Mesh Shader
+//  Projects each Gaussian once and emits its four quad vertices plus two triangles.
+// ============================================================
+class GAUSSIANSPLATTING_API FGaussianSplatMS : public FGlobalShader
+{
+    DECLARE_GLOBAL_SHADER(FGaussianSplatMS);
+    using FParameters = FGaussianSplatVS::FParameters;
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatMS, FGlobalShader);
+
+    using FPermutationDomain = FGaussianSplatVS::FPermutationDomain;
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return RHISupportsMeshShadersTier0(Parameters.Platform);
     }
 
     static void ModifyCompilationEnvironment(

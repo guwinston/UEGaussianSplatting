@@ -6,13 +6,16 @@
 
 class FRDGBuilder;
 class FRHICommandListImmediate;
+class FRHIGPUBufferReadback;
 
 // Render-side payload produced by the GPU sorter:
 //   - SortedIndexSRV stores the draw order over global splat indices
-//   - DrawIndirectArgsBuffer stores FRHIDrawIndirectParameters for the merged draw call
+//   - VisibleCountSRV stores the visible-prefix length consumed by the mesh shader
+//   - DrawIndirectArgsBuffer stores both draw and mesh-dispatch indirect parameters
 struct FGaussianSplatSortedDrawBuffers
 {
     FRDGBufferSRVRef SortedIndexSRV = nullptr;
+    FRDGBufferSRVRef VisibleCountSRV = nullptr;
     FRDGBufferRef DrawIndirectArgsBuffer = nullptr;
 };
 
@@ -47,6 +50,7 @@ public:
         const FMatrix44f& InViewToClip,
         float InTanHalfFovX,
         float InTanHalfFovY,
+        float InMaxFocalLengthPixels,
         int32 InTotalSplats,
         bool bLazy = true);
 
@@ -60,6 +64,7 @@ public:
         FRHICommandListImmediate& RHICmdList,
         const FShaderResourceViewRHIRef& GlobalPackedPositionSRV,
         const FShaderResourceViewRHIRef& GlobalPackedColorSRV,
+        const FShaderResourceViewRHIRef& GlobalPackedScaleSRV,
         const FShaderResourceViewRHIRef& GlobalChunkPositionMinSRV,
         const FShaderResourceViewRHIRef& GlobalChunkPositionMaxSRV,
         const FShaderResourceViewRHIRef& GlobalObjectIndexSRV,
@@ -77,6 +82,7 @@ private:
         FRHICommandListImmediate& RHICmdList,
         const FShaderResourceViewRHIRef& GlobalPackedPositionSRV,
         const FShaderResourceViewRHIRef& GlobalPackedColorSRV,
+        const FShaderResourceViewRHIRef& GlobalPackedScaleSRV,
         const FShaderResourceViewRHIRef& GlobalChunkPositionMinSRV,
         const FShaderResourceViewRHIRef& GlobalChunkPositionMaxSRV,
         const FShaderResourceViewRHIRef& GlobalObjectIndexSRV,
@@ -113,11 +119,13 @@ private:
     FMatrix44f RequestedViewToClip = FMatrix44f::Identity;
     float     RequestedTanHalfFovX = 1.0f;
     float     RequestedTanHalfFovY = 1.0f;
+    float     RequestedMaxFocalLengthPixels = 0.0f;
     int32     RequestedTotalSplats = 0;
 
     // Last successful sort fingerprint used by the lazy path.
     FMatrix44f LastSortedWorldToView = FMatrix44f::Identity;
     FMatrix44f LastSortedViewToClip = FMatrix44f::Identity;
+    float      LastSortedMaxFocalLengthPixels = -1.0f;
     int32      LastSortedTotalSplats = -1;
     int32      LastSortConfigSignature = -1;
 
@@ -162,8 +170,13 @@ private:
     FUnorderedAccessViewRHIRef     VisibleCountUAV;
     int32                          VisibleCountCapacity = 0;
 
-    // Persistent indirect draw args buffer reused by the raster pass and lazy reuse path.
+    // Persistent draw + mesh-dispatch indirect args reused by the raster and lazy paths.
     TRefCountPtr<FRDGPooledBuffer> DrawIndirectArgsPooled;
     FBufferRHIRef                  DrawIndirectArgsBufferRHI;
     FUnorderedAccessViewRHIRef     DrawIndirectArgsUAV;
+
+    // Async GPU readback of the per-frame visible-splat counter, used to populate the
+    // STAT_GaussianSplat_SplatsAfterCull stat (see `stat GaussianSplat`). Reused across frames.
+    FRHIGPUBufferReadback* VisibleCountReadback = nullptr;
+    bool bVisibleCountReadbackPending = false;
 };
