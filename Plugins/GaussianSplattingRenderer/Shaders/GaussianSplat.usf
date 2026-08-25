@@ -109,6 +109,7 @@ Buffer<uint> VisibleCountBuffer;
 // Camera / viewport (shared for all objects in this pass)
 float4x4  WorldToView;
 float4x4  ViewToClip;
+float4x4  PreviousWorldToClip;
 float3    CameraPosition;
 float2    FocalLength;      // (fx, fy) in pixels
 float2    ViewportMin;      // (minX, minY) in pixels
@@ -415,6 +416,7 @@ struct FVSOutput
 #endif
 #if STOCHASTIC_SPLAT
     nointerpolation uint SplatID : TEXCOORD2;
+    nointerpolation float3 Reprojection : TEXCOORD3; // previousUV-currentUV, validity
 #endif
 };
 
@@ -431,6 +433,7 @@ FVSOutput MakeInvalidOutput()
 #endif
 #if STOCHASTIC_SPLAT
     Out.SplatID = 0u;
+    Out.Reprojection = float3(0.0f, 0.0f, 0.0f);
 #endif
     return Out;
 }
@@ -478,8 +481,9 @@ FVSOutput GaussianSplatVS(uint VertexID : SV_VertexID)
     }
 
     // ---- Model-view transform (LocalToWorld * WorldToView) ----
-    float4x4 MV     = mul(obj.LocalToWorld, WorldToView);
-    float4   vCenter = mul(float4(splatPos, 1.0f), MV);
+    float4x4 MV         = mul(obj.LocalToWorld, WorldToView);
+    float4 worldCenter  = mul(float4(splatPos, 1.0f), obj.LocalToWorld);
+    float4 vCenter      = mul(worldCenter, WorldToView);
 
     // Cull: behind camera
     if (vCenter.z < 0.01f) {
@@ -574,6 +578,18 @@ FVSOutput GaussianSplatVS(uint VertexID : SV_VertexID)
     float2 pixelOffset = corner.x * bv1 + corner.y * bv2;
     float2 ndcOffset   = pixelOffset * float2(2.0f, -2.0f) / ViewportSize;
 
+#if STOCHASTIC_SPLAT
+    float3 reprojection = float3(0.0f, 0.0f, 0.0f);
+    const float4 previousClipCenter = mul(worldCenter, PreviousWorldToClip);
+    if (previousClipCenter.w > 1e-6f)
+    {
+        const float2 previousNdc = previousClipCenter.xy / previousClipCenter.w;
+        // Viewport UV has an inverted Y axis relative to NDC.
+        reprojection.xy = 0.5f * float2(previousNdc.x - ndcCenter.x, ndcCenter.y - previousNdc.y);
+        reprojection.z = 1.0f;
+    }
+#endif
+
 #if RASTER_MODE == 1
     float2 screenCenter;
     screenCenter.x = ViewportMin.x + (ndcCenter.x * 0.5f + 0.5f) * ViewportSize.x;
@@ -592,6 +608,7 @@ FVSOutput GaussianSplatVS(uint VertexID : SV_VertexID)
 #endif
 #if STOCHASTIC_SPLAT
     Out.SplatID = globalIdx;
+    Out.Reprojection = reprojection;
 #endif
 
     return Out;
@@ -655,8 +672,9 @@ void GaussianSplatMS(
 
             if (splatColor.a >= obj.AlphaCullThreshold)
             {
-                float4x4 MV = mul(obj.LocalToWorld, WorldToView);
-                float4 vCenter = mul(float4(splatPos, 1.0f), MV);
+                float4x4 MV       = mul(obj.LocalToWorld, WorldToView);
+                float4 worldCenter = mul(float4(splatPos, 1.0f), obj.LocalToWorld);
+                float4 vCenter     = mul(worldCenter, WorldToView);
 
                 if (vCenter.z >= 0.01f)
                 {
@@ -726,6 +744,17 @@ void GaussianSplatMS(
 #else
                             float2 screenCenter = float2(0,0);
 #endif
+#if STOCHASTIC_SPLAT
+                            float3 reprojection = float3(0.0f, 0.0f, 0.0f);
+                            const float4 previousClipCenter = mul(worldCenter, PreviousWorldToClip);
+                            if (previousClipCenter.w > 1e-6f)
+                            {
+                                const float2 previousNdc = previousClipCenter.xy / previousClipCenter.w;
+                                reprojection.xy = 0.5f * float2(
+                                    previousNdc.x - ndcCenter.x, ndcCenter.y - previousNdc.y);
+                                reprojection.z = 1.0f;
+                            }
+#endif
                             [unroll]
                             for (uint CornerIndex = 0u; CornerIndex < 4u; ++CornerIndex)
                             {
@@ -744,6 +773,7 @@ void GaussianSplatMS(
 #endif
 #if STOCHASTIC_SPLAT
                                 Out.SplatID = globalIdx;
+                                Out.Reprojection = reprojection;
 #endif
                                 ProjectedVertices[CornerIndex] = Out;
                             }
@@ -795,7 +825,15 @@ float GaussianStochasticRandom(uint2 Pixel, uint SplatID, uint FrameIndex)
 // ============================================================
 // PIXEL SHADER
 // ============================================================
-float4 GaussianSplatPS(FVSOutput In) : SV_Target0
+struct FGaussianSplatPSOutput
+{
+    float4 Color : SV_Target0;
+#if STOCHASTIC_SPLAT
+    float4 Motion : SV_Target1;
+#endif
+};
+
+FGaussianSplatPSOutput GaussianSplatPS(FVSOutput In)
 {
     if (UseManualSceneDepthTest != 0u)
     {
@@ -842,9 +880,14 @@ float4 GaussianSplatPS(FVSOutput In) : SV_Target0
     {
         discard;
     }
-    return float4(In.SplatColor.rgb, 1.0f);
+    FGaussianSplatPSOutput Out;
+    Out.Color = float4(In.SplatColor.rgb, 1.0f);
+    Out.Motion = float4(In.Reprojection.xy, 0.0f, In.Reprojection.z);
+    return Out;
 #else
-    return float4(In.SplatColor.rgb * alpha, alpha);
+    FGaussianSplatPSOutput Out;
+    Out.Color = float4(In.SplatColor.rgb * alpha, alpha);
+    return Out;
 #endif
 }
 
@@ -903,12 +946,77 @@ float4 GaussianSplatCompositePS(FCompositeVSOutput In) : SV_Target0
 
 Texture2D CurrentSampleTexture;
 Texture2D HistoryTexture;
+Texture2D MotionTexture;
+SamplerState HistoryTextureSampler;
 float CurrentSampleWeight;
+float2 TextureExtentInverse;
+uint HistoryValid;
+uint UseReprojection;
 
 float4 GaussianSplatTemporalPS(FCompositeVSOutput In) : SV_Target0
 {
     const int2 pixelCoord = int2(In.Position.xy);
     const float4 currentSample = CurrentSampleTexture.Load(int3(pixelCoord, 0));
-    const float4 history = HistoryTexture.Load(int3(pixelCoord, 0));
-    return lerp(history, currentSample, saturate(CurrentSampleWeight));
+    if (HistoryValid == 0u)
+    {
+        return currentSample;
+    }
+
+    float2 historyPixel = float2(pixelCoord) + 0.5f;
+    float sampleWeight = saturate(CurrentSampleWeight);
+
+    if (UseReprojection != 0u)
+    {
+        float4 motion = MotionTexture.Load(int3(pixelCoord, 0));
+        if (motion.w < 0.5f)
+        {
+            // Stochastic rejection leaves pixels without a velocity. Borrow the nearest
+            // accepted sample's motion so the accumulated image remains coherent while
+            // moving instead of exposing a fresh black/noisy hole at that pixel.
+            float bestDistance = 1e9f;
+            float4 bestMotion = motion;
+            const int2 viewportMin = int2(ViewportMin);
+            const int2 viewportMax = int2(ViewportMin + ViewportSize) - 1;
+            [unroll]
+            for (int y = -1; y <= 1; ++y)
+            {
+                [unroll]
+                for (int x = -1; x <= 1; ++x)
+                {
+                    const int2 candidatePixel = clamp(pixelCoord + int2(x, y), viewportMin, viewportMax);
+                    const float4 candidate = MotionTexture.Load(int3(candidatePixel, 0));
+                    const float distanceSquared = float(x * x + y * y);
+                    if (candidate.w >= 0.5f && distanceSquared < bestDistance)
+                    {
+                        bestDistance = distanceSquared;
+                        bestMotion = candidate;
+                    }
+                }
+            }
+            motion = bestMotion;
+        }
+
+        if (motion.w >= 0.5f)
+        {
+            historyPixel += motion.xy * ViewportSize;
+        }
+        else
+        {
+            // No nearby velocity is available at a newly uncovered low-opacity pixel.
+            // Keep a short zero-motion history to trade a small trail for much less snow.
+            sampleWeight = max(sampleWeight, 0.25f);
+        }
+    }
+
+    const float2 viewportMaxExclusive = ViewportMin + ViewportSize;
+    const bool historyInBounds = all(historyPixel >= ViewportMin)
+        && all(historyPixel < viewportMaxExclusive);
+    if (!historyInBounds)
+    {
+        return currentSample;
+    }
+
+    const float2 historyUV = historyPixel * TextureExtentInverse;
+    const float4 history = HistoryTexture.SampleLevel(HistoryTextureSampler, historyUV, 0.0f);
+    return lerp(history, currentSample, sampleWeight);
 }

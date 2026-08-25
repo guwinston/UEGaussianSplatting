@@ -23,6 +23,10 @@ namespace GaussianSplatCVars
     int32 GetSortMethodOnRenderThread();
     /** Number of stochastic frames to accumulate. 0 disables temporal accumulation. */
     int32 GetStochasticTemporalSamplesOnRenderThread();
+    /** Whether stochastic history follows camera motion using per-splat screen velocity. */
+    int32 GetStochasticReprojectionOnRenderThread();
+    /** Effective history length retained while the camera is moving. */
+    int32 GetStochasticMotionSamplesOnRenderThread();
     int32 GetDeviceRadixPassCountOnRenderThread();
     int32 GetDeviceRadixWriteFinalKeysOnRenderThread();
 }

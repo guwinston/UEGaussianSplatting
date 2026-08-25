@@ -58,6 +58,21 @@ static TAutoConsoleVariable<int32> CVarGaussianSplatStochasticTemporalSamples(
     TEXT(" N = running-average N samples, then freeze until the view or scene changes"),
     ECVF_RenderThreadSafe);
 
+static TAutoConsoleVariable<int32> CVarGaussianSplatStochasticReprojection(
+    TEXT("r.GaussianSplat.StochasticReprojection"),
+    1,
+    TEXT("Reproject stochastic temporal history during camera motion.\n")
+    TEXT(" 0 = reset history whenever the camera changes\n")
+    TEXT(" 1 = use per-splat screen motion and a dilated velocity fallback"),
+    ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarGaussianSplatStochasticMotionSamples(
+    TEXT("r.GaussianSplat.StochasticMotionSamples"),
+    8,
+    TEXT("Maximum effective stochastic history length while the camera is moving (1-64).\n")
+    TEXT("Lower values reduce ghosting; higher values reduce moving-image noise."),
+    ECVF_RenderThreadSafe);
+
 static TAutoConsoleVariable<int32> CVarGaussianSplatDeviceRadixPasses(
     TEXT("r.GaussianSplat.DeviceRadixPasses"),
     4,
@@ -199,6 +214,16 @@ namespace GaussianSplatCVars
     int32 GetStochasticTemporalSamplesOnRenderThread()
     {
         return FMath::Clamp(CVarGaussianSplatStochasticTemporalSamples.GetValueOnRenderThread(), 0, 4096);
+    }
+
+    int32 GetStochasticReprojectionOnRenderThread()
+    {
+        return CVarGaussianSplatStochasticReprojection.GetValueOnRenderThread() != 0 ? 1 : 0;
+    }
+
+    int32 GetStochasticMotionSamplesOnRenderThread()
+    {
+        return FMath::Clamp(CVarGaussianSplatStochasticMotionSamples.GetValueOnRenderThread(), 1, 64);
     }
 
     int32 GetDeviceRadixPassCountOnRenderThread()

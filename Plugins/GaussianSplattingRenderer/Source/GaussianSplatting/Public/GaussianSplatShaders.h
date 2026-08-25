@@ -217,6 +217,7 @@ class GAUSSIANSPLATTING_API FGaussianSplatVS : public FGlobalShader
 
         SHADER_PARAMETER(FMatrix44f, WorldToView)
         SHADER_PARAMETER(FMatrix44f, ViewToClip)
+        SHADER_PARAMETER(FMatrix44f, PreviousWorldToClip)
         SHADER_PARAMETER(FVector3f, CameraPosition)
         SHADER_PARAMETER(FVector2f, FocalLength)
         SHADER_PARAMETER(FVector2f, ViewportMin)
@@ -355,7 +356,14 @@ class GAUSSIANSPLATTING_API FGaussianSplatTemporalPS : public FGlobalShader
     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
         SHADER_PARAMETER_RDG_TEXTURE(Texture2D, CurrentSampleTexture)
         SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HistoryTexture)
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, MotionTexture)
+        SHADER_PARAMETER_SAMPLER(SamplerState, HistoryTextureSampler)
         SHADER_PARAMETER(float, CurrentSampleWeight)
+        SHADER_PARAMETER(FVector2f, TextureExtentInverse)
+        SHADER_PARAMETER(FVector2f, ViewportMin)
+        SHADER_PARAMETER(FVector2f, ViewportSize)
+        SHADER_PARAMETER(uint32, HistoryValid)
+        SHADER_PARAMETER(uint32, UseReprojection)
     END_SHADER_PARAMETER_STRUCT()
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)

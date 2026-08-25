@@ -159,8 +159,11 @@ private:
         TRefCountPtr<IPooledRenderTarget> Texture;
         uint32 Signature = 0;
         uint32 SampleCount = 0;
+        uint32 CameraSignature = 0;
         FIntPoint Extent = FIntPoint::ZeroValue;
         FIntRect ViewRect;
+        FMatrix44f PreviousWorldToClip = FMatrix44f::Identity;
+        bool bHasPreviousCamera = false;
     };
 
     // One progressive history per persistent UE view state. Shared values keep the

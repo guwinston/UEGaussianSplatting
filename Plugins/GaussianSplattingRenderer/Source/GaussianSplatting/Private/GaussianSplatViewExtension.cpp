@@ -522,6 +522,8 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
 
     const FMatrix44f WorldToView = FMatrix44f(ViewMatrix);
     const FMatrix44f ViewToClip  = FMatrix44f(ProjMatrix);
+    const FMatrix44f CurrentWorldToClip = FMatrix44f(ViewMatrix * ProjMatrix);
+    const FMatrix44f CurrentUnjitteredWorldToClip = FMatrix44f(ViewMatrix * InView.ViewMatrices.ComputeProjectionNoAAMatrix());
 
     TArray<const FGaussianSplatSceneProxy*> ValidProxies;
     ValidProxies.Reserve(ProxiesToRender.Num());
@@ -604,7 +606,13 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     // Prepare per-view stochastic history before sort/draw resources are queued.
     const int32 StochasticTemporalSampleLimit = bUseStochasticSplat
         ? GaussianSplatCVars::GetStochasticTemporalSamplesOnRenderThread() : 0;
+    const bool bUseStochasticReprojection = StochasticTemporalSampleLimit > 0
+        && GaussianSplatCVars::GetStochasticReprojectionOnRenderThread() != 0;
+    const uint32 StochasticMotionSampleLimit = static_cast<uint32>(
+        GaussianSplatCVars::GetStochasticMotionSamplesOnRenderThread());
     TSharedPtr<FStochasticTemporalHistory> TemporalHistory;
+    FMatrix44f PreviousWorldToClip = CurrentWorldToClip;
+    bool bStochasticCameraChanged = false;
     uint32 StochasticSampleIndex = InView.Family
         ? static_cast<uint32>(InView.Family->FrameNumber) : 0u;
     if (StochasticTemporalSampleLimit > 0)
@@ -621,12 +629,10 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
             }
             TemporalHistory = HistorySlot;
 
-            const FMatrix44f HistoryViewMatrix(ViewMatrix);
-            const FMatrix44f HistoryProjectionMatrix(InView.ViewMatrices.ComputeProjectionNoAAMatrix());
-            uint32 HistorySignature = FCrc::MemCrc32(&HistoryViewMatrix, sizeof(HistoryViewMatrix));
-            HistorySignature = FCrc::MemCrc32(&HistoryProjectionMatrix, sizeof(HistoryProjectionMatrix), HistorySignature);
-            HistorySignature = FCrc::MemCrc32(
-                ObjectDescs.GetData(), ObjectDescs.Num() * sizeof(FGaussianSplatObjectGPUDesc), HistorySignature);
+            const uint32 CurrentCameraSignature = FCrc::MemCrc32(
+                &CurrentUnjitteredWorldToClip, sizeof(CurrentUnjitteredWorldToClip));
+            uint32 HistorySignature = FCrc::MemCrc32(
+                ObjectDescs.GetData(), ObjectDescs.Num() * sizeof(FGaussianSplatObjectGPUDesc));
             for (const FGaussianSplatSceneProxy* Proxy : ValidProxies)
             {
                 HistorySignature = HashCombine(HistorySignature, GetTypeHash(reinterpret_cast<UPTRINT>(Proxy)));
@@ -641,20 +647,41 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
             HistorySignature = HashCombine(HistorySignature, GetTypeHash(GaussianSplatCVars::GetScreenSizeCullOnAnyThread()));
             HistorySignature = HashCombine(HistorySignature, GetTypeHash(GaussianSplatCVars::GetScreenSizeCullMinPixelsOnAnyThread()));
             HistorySignature = HashCombine(HistorySignature, GetTypeHash(bCompositeToUELinear));
+            HistorySignature = HashCombine(HistorySignature, GetTypeHash(bUseStochasticReprojection));
+            HistorySignature = HashCombine(HistorySignature, GetTypeHash(StochasticMotionSampleLimit));
+            if (!bUseStochasticReprojection)
+            {
+                // Preserve the original behavior when reprojection is disabled: a camera
+                // change becomes a history-signature change and restarts accumulation.
+                HistorySignature = HashCombine(HistorySignature, CurrentCameraSignature);
+            }
 
             const bool bResetHistory = bRebuiltStaticBuffers
                 || TemporalHistory->Signature != HistorySignature
                 || TemporalHistory->Extent != SceneColorTexture->Desc.Extent
-                || TemporalHistory->ViewRect != ViewRect;
+                || TemporalHistory->ViewRect != ViewRect
+                || InView.bCameraCut;
             if (bResetHistory)
             {
                 TemporalHistory->Texture.SafeRelease();
                 TemporalHistory->SampleCount = 0;
                 TemporalHistory->Signature = HistorySignature;
+                TemporalHistory->CameraSignature = CurrentCameraSignature;
                 TemporalHistory->Extent = SceneColorTexture->Desc.Extent;
                 TemporalHistory->ViewRect = ViewRect;
+                TemporalHistory->PreviousWorldToClip = CurrentWorldToClip;
+                TemporalHistory->bHasPreviousCamera = true;
             }
-            StochasticSampleIndex = TemporalHistory->SampleCount;
+            else
+            {
+                bStochasticCameraChanged = TemporalHistory->CameraSignature != CurrentCameraSignature;
+            }
+            PreviousWorldToClip = TemporalHistory->bHasPreviousCamera
+                ? TemporalHistory->PreviousWorldToClip : CurrentWorldToClip;
+            if (!bUseStochasticReprojection)
+            {
+                StochasticSampleIndex = TemporalHistory->SampleCount;
+            }
         }
     }
 
@@ -816,6 +843,17 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         }
     }
 
+    FRDGTextureRef GaussianStochasticMotionTexture = nullptr;
+    if (bUseStochasticReprojection)
+    {
+        const FRDGTextureDesc MotionDesc = FRDGTextureDesc::Create2D(
+            SceneColorTexture->Desc.Extent,
+            PF_FloatRGBA,
+            FClearValueBinding(FLinearColor::Transparent),
+            TexCreate_ShaderResource | TexCreate_RenderTargetable);
+        GaussianStochasticMotionTexture = GraphBuilder.CreateTexture(MotionDesc, TEXT("GS_StochasticMotion"));
+    }
+
     FRDGTextureRef GaussianStochasticDepthTexture = nullptr;
     if (bUseStochasticSplat)
     {
@@ -841,6 +879,11 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         PassParams->RenderTargets[0] = FRenderTargetBinding(
             bRenderToAccumTexture ? GaussianAccumTexture : SceneColorTexture,
             bRenderToAccumTexture ? ERenderTargetLoadAction::EClear : ERenderTargetLoadAction::ELoad);
+        if (GaussianStochasticMotionTexture)
+        {
+            PassParams->RenderTargets[1] = FRenderTargetBinding(
+                GaussianStochasticMotionTexture, ERenderTargetLoadAction::EClear);
+        }
         if (bUseStochasticSplat)
         {
             PassParams->RenderTargets.DepthStencil = FDepthStencilBinding(
@@ -877,6 +920,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
 
         PassParams->VS.WorldToView      = WorldToView;
         PassParams->VS.ViewToClip       = ViewToClip;
+        PassParams->VS.PreviousWorldToClip = PreviousWorldToClip;
         PassParams->VS.CameraPosition   = CameraPos;
         PassParams->VS.FocalLength      = FVector2f(FX, FY);
         PassParams->VS.ViewportMin      = FVector2f(VMinX, VMinY);
@@ -1001,6 +1045,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
                 const bool bHistoryValid = TemporalHistory->Texture.IsValid()
                     && TemporalHistory->SampleCount > 0;
                 const bool bHistoryConverged = bHistoryValid
+                    && !bStochasticCameraChanged
                     && TemporalHistory->SampleCount >= static_cast<uint32>(StochasticTemporalSampleLimit);
 
                 if (bHistoryConverged)
@@ -1026,8 +1071,22 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
                         HistoryOutput, ERenderTargetLoadAction::EClear);
                     TemporalParams->PS.CurrentSampleTexture = GaussianAccumTexture;
                     TemporalParams->PS.HistoryTexture = HistoryInput;
+                    TemporalParams->PS.MotionTexture = GaussianStochasticMotionTexture
+                        ? GaussianStochasticMotionTexture : GSystemTextures.GetBlackDummy(GraphBuilder);
+                    TemporalParams->PS.HistoryTextureSampler =
+                        TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+                    const uint32 EffectivePriorSamples = bStochasticCameraChanged && bUseStochasticReprojection
+                        ? FMath::Min(TemporalHistory->SampleCount, StochasticMotionSampleLimit - 1u)
+                        : TemporalHistory->SampleCount;
                     TemporalParams->PS.CurrentSampleWeight = 1.0f
-                        / static_cast<float>(TemporalHistory->SampleCount + 1u);
+                        / static_cast<float>(EffectivePriorSamples + 1u);
+                    TemporalParams->PS.TextureExtentInverse = FVector2f(
+                        1.0f / static_cast<float>(SceneColorTexture->Desc.Extent.X),
+                        1.0f / static_cast<float>(SceneColorTexture->Desc.Extent.Y));
+                    TemporalParams->PS.ViewportMin = FVector2f(VMinX, VMinY);
+                    TemporalParams->PS.ViewportSize = FVector2f(VW, VH);
+                    TemporalParams->PS.HistoryValid = bHistoryValid ? 1u : 0u;
+                    TemporalParams->PS.UseReprojection = bUseStochasticReprojection ? 1u : 0u;
 
                     GraphBuilder.AddPass(
                         RDG_EVENT_NAME("GaussianSplat_StochasticTemporal_%u", TemporalHistory->SampleCount + 1u),
@@ -1055,10 +1114,23 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
                     GaussianAccumTexture = HistoryOutput;
                     TemporalHistory->Texture.SafeRelease();
                     GraphBuilder.QueueTextureExtraction(HistoryOutput, &TemporalHistory->Texture);
-                    TemporalHistory->SampleCount = FMath::Min<uint32>(
-                        TemporalHistory->SampleCount + 1u,
-                        static_cast<uint32>(StochasticTemporalSampleLimit));
+                    if (bStochasticCameraChanged && bUseStochasticReprojection)
+                    {
+                        TemporalHistory->SampleCount = FMath::Min(
+                            EffectivePriorSamples + 1u, StochasticMotionSampleLimit);
+                    }
+                    else
+                    {
+                        TemporalHistory->SampleCount = FMath::Min<uint32>(
+                            TemporalHistory->SampleCount + 1u,
+                            static_cast<uint32>(StochasticTemporalSampleLimit));
+                    }
                 }
+
+                TemporalHistory->PreviousWorldToClip = CurrentWorldToClip;
+                TemporalHistory->CameraSignature = FCrc::MemCrc32(
+                    &CurrentUnjitteredWorldToClip, sizeof(CurrentUnjitteredWorldToClip));
+                TemporalHistory->bHasPreviousCamera = true;
             }
 
             CompositeParams->RenderTargets[0] = FRenderTargetBinding(SceneColorTexture, ERenderTargetLoadAction::ELoad);
