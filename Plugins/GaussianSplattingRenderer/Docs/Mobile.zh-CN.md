@@ -13,7 +13,7 @@
 | Android arm64 | OpenGL ES3.1 | 未支持 | 项目未启用 |
 | iOS | Metal MRT / SM5 | 实验性 | 尚未完成真机验证和性能调优 |
 
-Android 路径保留完整逐点 GPU 排序和透明混合。目前没有 LOD、分块排序或 compute tile rasterizer，因此大场景在手机 GPU 上的成本明显高于桌面平台。
+Android 路径保留逐 splat GPU 处理和透明混合。DeviceRadix 会压缩并只排序实际可见数量，但 Key 生成仍需遍历合并数据流。目前没有自适应 LOD、分块排序或 compute tile rasterizer，因此大场景在手机 GPU 上的成本仍明显高于桌面平台。
 
 ## 渲染管线
 
@@ -21,12 +21,14 @@ Android 路径保留完整逐点 GPU 排序和透明混合。目前没有 LOD、
 
 1. 对 Gaussian 对象做包围盒视锥剔除。
 2. 遍历合并后的 splat 数据，逐点剔除并生成 32 位深度 Key。
-3. 使用 UE `SortGPUBuffers` 执行全局 GPU radix sort。
+3. 默认压缩可见 key/value，并由 DeviceRadix 按 GPU 实际可见数量排序。
 4. 根据可见计数生成 indirect draw 参数。
 5. 按排序索引绘制旋转椭圆并透明混合。
 6. Integrate With UE 模式将累积纹理合成到 SceneColor；Direct 模式直接写入 SceneColor。
 
-静止相机默认复用上一次排序。相机或投影矩阵变化后会重新排序。即使大部分 splat 被剔除，当前 radix sort 输入仍是总 splat 数量，这是主要优化空间之一。
+静止相机默认复用上一次排序。相机或投影矩阵变化后会重新排序。`SortMethod 1` 排序压缩后的可见前缀；`SortMethod 0` 是仍排序完整分配流的兼容路径。实验性 `SortMethod 2` 跳过排序，改用 Stochastic depth 与时域累积。
+
+`GeometryMode 1` 请求 Mesh Shader + PS，但移动 RHI 不提供 Mesh Shader 时会自动回退 VS + PS。当前已验证的 Android 硬件应按 VS 路径理解。
 
 ## Android 配置
 
@@ -91,7 +93,7 @@ r.GaussianSplat.EnableAntialiasing=0
 r.GaussianSplat.OpacityAwareBounds=1
 ```
 
-这些设置降低 Shader 和像素成本，但不会自动缩小全局排序输入。
+这些设置降低 Shader 和像素成本。渲染器默认使用 DeviceRadix 可见数量排序、`1.0` 像素阈值的屏幕尺寸剔除，并在 Mesh Shader 不可用时自动回退 VS。
 
 ## 性能分析
 
@@ -145,6 +147,11 @@ r.GaussianSplat.ForceSortEveryFrame 0
 
 ```text
 r.ScreenPercentage 50
+r.GaussianSplat.SortMethod 0
+r.GaussianSplat.SortMethod 1
+r.GaussianSplat.ScreenSizeCull 0
+r.GaussianSplat.ScreenSizeCull 1
+r.GaussianSplat.ScreenSizeCullMinPixels 1.0
 r.GaussianSplat.OpacityAwareBounds 0
 r.GaussianSplat.OpacityAwareBounds 1
 r.GaussianSplat.CullMode 0
@@ -164,18 +171,19 @@ extent = sqrt(2 * log(opacity / alphaThreshold))
 - 降低 `r.ScreenPercentage` 后 Direct 明显下降：主要受 fragment、带宽或 overdraw 限制。
 - 强制逐帧排序后 GPU Sort 明显上升：主要受全局排序限制。
 - 静止相机明显快于移动相机：排序复用有效，移动重排成本较高。
-- 画面无 Gaussian 但移动相机仍慢：当前实现仍可能生成全量 Key 并排序总 splat 流。
+- 画面无 Gaussian 但移动相机仍慢：瓶颈来自 Key 生成或其他逐帧工作；DeviceRadix 本身接收零可见数量，不再排序总 splat 流。
 
 ## 已知限制与后续方向
 
-- 全局排序以总 splat 数量为输入，剔除不会压缩 radix sort 元素。
-- 没有按屏幕贡献度选择 splat 的 LOD。
+- Key 生成仍会覆盖合并后的 splat 数据流，但 DeviceRadix 只排序可见前缀。
+- 屏幕尺寸剔除是阈值开关，还不是连续的屏幕贡献度 LOD 系统。
 - 没有 tile binning 或 compute tile rasterizer，透明 overdraw 较高。
 - 大型近景 splat 可能覆盖大量像素。
+- Stochastic 渲染能够免排序，但需要全分辨率 depth/history；运动重投影还会增加一个 `PF_FloatRGBA` motion target，在移动端仍属实验性。
 - Adreno 650 不支持 `R64_UINT`，当前保持 32 位 Key/索引路径。
 - Vulkan timestamp 在部分旧驱动上可能不稳定。
 
-优先方向是：全对象不可见时跳过排序、压缩并只排序可见 splat、屏幕空间 LOD，以及分块/compute rasterization。
+后续重点是减少 Key 生成工作量、自适应屏幕空间 LOD、分块/compute rasterization，以及验证 Stochastic history 在移动端的带宽与显存成本。
 
 ## 排错
 

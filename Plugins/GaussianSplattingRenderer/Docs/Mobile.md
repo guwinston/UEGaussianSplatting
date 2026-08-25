@@ -13,7 +13,7 @@ This document covers mobile support, Android packaging, on-device profiling, tun
 | Android arm64 | OpenGL ES3.1 | Unsupported | Not enabled by this project |
 | iOS | Metal MRT / SM5 | Experimental | Device validation and performance tuning are incomplete |
 
-The Android path retains full per-splat GPU sorting and transparent blending. It has no LOD, tiled sorting, or compute tile rasterizer yet, so large scenes are much more expensive on mobile GPUs than on desktop hardware.
+The Android path retains per-splat GPU processing and transparent blending. DeviceRadix compacts and sorts only the visible count, but key generation still examines the merged stream. There is no adaptive LOD, tiled sorting, or compute tile rasterizer yet, so large scenes remain much more expensive on mobile GPUs than on desktop hardware.
 
 ## Rendering Pipeline
 
@@ -21,12 +21,14 @@ When sorting must be updated, the renderer performs:
 
 1. Object-bounds frustum culling.
 2. Per-splat culling and 32-bit depth-key generation over the merged stream.
-3. Global GPU radix sorting through UE `SortGPUBuffers`.
+3. Visible key/value compaction and DeviceRadix sorting over the GPU visible count by default.
 4. Indirect draw-argument generation from the visible count.
 5. Sorted ellipse rasterization and transparent blending.
 6. Accumulation-texture composition in Integrate With UE mode, or direct SceneColor output in Direct mode.
 
-A stationary camera reuses the previous sort. Camera or projection changes request a new sort. The radix-sort input remains the total splat count even when most splats are culled.
+A stationary camera reuses the previous sort. Camera or projection changes request a new sort. `SortMethod 1` sorts the compacted visible prefix; `SortMethod 0` is the compatibility path that still sorts the total allocated stream. Experimental `SortMethod 2` skips sorting and uses stochastic depth plus temporal accumulation.
+
+`GeometryMode 1` requests Mesh Shader + PS, but the renderer automatically falls back to VS + PS when the mobile RHI does not expose mesh shaders. Current validated Android hardware should be treated as using the VS path.
 
 ## Android Configuration
 
@@ -91,7 +93,7 @@ r.GaussianSplat.EnableAntialiasing=0
 r.GaussianSplat.OpacityAwareBounds=1
 ```
 
-These settings reduce shader and pixel costs but do not reduce the global-sort input count.
+These settings reduce shader and pixel costs. The renderer defaults to DeviceRadix visible-count sorting, screen-size culling at a `1.0` pixel threshold, and automatic VS fallback when mesh shaders are unavailable.
 
 ## Performance Profiling
 
@@ -145,6 +147,11 @@ Run controlled A/B tests from the same view:
 
 ```text
 r.ScreenPercentage 50
+r.GaussianSplat.SortMethod 0
+r.GaussianSplat.SortMethod 1
+r.GaussianSplat.ScreenSizeCull 0
+r.GaussianSplat.ScreenSizeCull 1
+r.GaussianSplat.ScreenSizeCullMinPixels 1.0
 r.GaussianSplat.OpacityAwareBounds 0
 r.GaussianSplat.OpacityAwareBounds 1
 r.GaussianSplat.CullMode 0
@@ -164,18 +171,19 @@ Bottleneck indicators:
 - A large Direct reduction at lower `r.ScreenPercentage` indicates fragment, bandwidth, or overdraw pressure.
 - A large GPU Sort increase with forced sorting indicates global-sort pressure.
 - A stationary camera being faster than a moving one indicates effective sort reuse and expensive re-sorting.
-- Slow camera movement with no visible Gaussian means the renderer may still key and sort the total splat stream.
+- Slow camera movement with no visible Gaussian indicates key-generation or other per-frame work; DeviceRadix itself receives a zero visible count rather than sorting the total stream.
 
 ## Known Limitations and Roadmap
 
-- Culling does not compact the global radix-sort input.
-- There is no screen-contribution LOD.
+- Key generation still dispatches over the merged splat stream even though DeviceRadix sorts only the visible prefix.
+- Screen-size culling is a threshold, not a continuous screen-contribution LOD system.
 - There is no tile binning or compute tile rasterizer.
 - Large nearby splats can cover many pixels.
+- Stochastic rendering avoids sorting but requires full-resolution depth/history resources; motion reprojection adds a `PF_FloatRGBA` motion target and is experimental on mobile.
 - Adreno 650 has no `R64_UINT` support; the renderer uses 32-bit keys and indices.
 - Timestamp queries may be unstable on older Vulkan drivers.
 
-Priorities are skipping sort when all objects are outside the view, compacting and sorting visible splats only, screen-space LOD, and tiled or compute rasterization.
+Remaining priorities are reducing key-generation work, adaptive screen-space LOD, tiled or compute rasterization, and mobile-specific validation of stochastic history bandwidth and memory.
 
 ## Troubleshooting
 

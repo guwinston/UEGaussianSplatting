@@ -2,234 +2,115 @@
 
 [English](GPUSorting.md) | [简体中文](GPUSorting.zh-CN.md)
 
-This document describes the current GPU sorting path used by the plugin, including sorting goals, data structures, the sorting flow, and the design rationale behind it.
+This document describes the current ordering paths used by `GaussianSplattingRenderer`. The renderer merges visible Gaussian objects into one global splat stream so transparent ordering is correct across object boundaries.
 
-It does not re-explain:
+## 1. Why Sorting Is Needed
 
-- projection of 3D Gaussians into 2D ellipses
-- proxy-mesh shadow casting
-- `.ply` import and compression build steps
+The normal renderer uses source-alpha blending and draws splats back to front. Sorting each actor independently is insufficient: splats from two overlapping actors must participate in the same view-dependent order.
 
-## 1. Sorting Goal
+The experimental stochastic path is the exception. It replaces ordered alpha blending with probabilistic coverage, a private depth target, and temporal reconstruction.
 
-The current rendering path uses back-to-front alpha blending. That requires all splats participating in translucent accumulation to be ordered from far to near in the current view.
+## 2. Per-Frame Overview
 
-For a single Gaussian object, sorting only inside that object would be enough. The plugin, however, supports multiple Gaussian objects contributing to the same final view and requires correct occlusion:
+When an ordered path needs a new sort, the GPU performs:
 
-- between Gaussian objects
-- between Gaussian objects and UE meshes
+1. object-level visibility testing;
+2. per-splat culling and 32-bit depth-key generation;
+3. visible key/value compaction when DeviceRadix is active;
+4. GPU sorting;
+5. indirect argument generation from the GPU visible count;
+6. VS or Mesh Shader rasterization in sorted order.
 
-The goal is therefore not object-local sorting, but a single global sort over all splats participating in the current view.
+A stationary view normally reuses the previous result. Set `r.GaussianSplat.ForceSortEveryFrame 1` only while measuring sort cost, then restore it to `0`.
 
-## 2. Sorting System Overview
+## 3. Sort Methods
 
-The current sorting path consists of three parts:
+`r.GaussianSplat.SortMethod` selects the path:
 
-1. merged global static splat buffers
-2. per-frame GPU culling and depth-key generation
-3. a global GPU sort performed through UE's built-in GPU sorting interface
+| Value | Path | Input size | Purpose |
+| --- | --- | --- | --- |
+| `0` | UE `SortGPUBuffers` | Allocated total splat count | Compatibility and reference |
+| `1` | DeviceRadix | GPU visible count | Default high-performance ordered path |
+| `2` | Stochastic no-sort | No depth sort | Experimental quality/performance tradeoff |
 
-The renderer does not reorder full splat attribute buffers every frame. Instead, it produces a sorted global splat index stream, and the vertex shader uses that stream to fetch the corresponding splat attributes from static buffers.
+If DeviceRadix is unavailable on the active RHI, method `1` falls back to the UE built-in sorter.
 
-Relevant code:
+### 3.1 UE Built-In Sort
 
-- [GaussianSplatViewExtension.cpp](../Source/GaussianSplatting/Private/GaussianSplatViewExtension.cpp)
-- [GaussianSplatSorter.cpp](../Source/GaussianSplatting/Private/GaussianSplatSorter.cpp)
-- [GaussianSplatCullAndSortKeyGen.usf](../Shaders/GaussianSplatCullAndSortKeyGen.usf)
+The compatibility path writes one key/value entry for every allocated splat. Culled entries receive a sentinel key and move to the tail, but `SortGPUBuffers` still processes `TotalSplatCount`. This is useful as a correctness baseline, but culling does not reduce the radix workload.
 
-## 3. Sorting Infrastructure
+No engine source is modified. The plugin calls the public renderer infrastructure as provided by UE.
 
-The plugin does not implement a full standalone GPU sorter from scratch. It reuses UE's GPU sorting interface:
+### 3.2 DeviceRadix Visible-Count Sort
 
-```cpp
-SortGPUBuffers(...)
+The default path atomically compacts visible key/value pairs into the prefix `[0, VisibleCount)`. The visible count remains on the GPU and is passed to DeviceRadix as its active element count; there is no CPU readback or frame stall.
+
+Buffer capacity is still sized for the total splat count, but radix histogram, prefix, and scatter work only cover the active visible prefix. Consequently, object culling, per-splat frustum culling, and screen-size culling can directly lower sort work.
+
+DeviceRadix uses configurable 8-bit least-significant-digit passes:
+
+```text
+r.GaussianSplat.DeviceRadixPasses 4
+r.GaussianSplat.DeviceRadixWriteFinalKeys 0
 ```
 
-The plugin side is responsible for:
+The pass count is clamped to `1..4`. Four passes sort the complete 32-bit key. Fewer passes start at `32 - PassCount * 8`, reducing cost but also depth-order precision. The final sorted keys are disabled by default because rasterization only consumes sorted values/indices.
 
-- preparing key/value buffers
-- object-level and per-splat culling
-- maintaining the visible splat count
-- generating indirect draw arguments
+### 3.3 Stochastic No-Sort
 
-UE is responsible for the actual GPU sort.
+Method `2` compacts visible IDs directly into the final index buffer and skips global depth sorting. Visibility is resolved by stochastic acceptance and depth during rasterization, then temporally accumulated. See [Stochastic Rendering](StochasticRendering.md).
 
-The relevant UE implementation is in `GPUSort.h` and `GPUSort.cpp`. That sorter uses GPU **radix sort** and explicitly defines:
+## 4. Key and Value Layout
 
-```cpp
-#define RADIX_BITS 4
+Each ordered entry contains:
+
+- a 32-bit sortable depth key;
+- a 32-bit global splat index.
+
+The index addresses the merged attribute buffers, so a single sorted stream can contain splats from every visible Gaussian object. The key transform preserves the required far-to-near order for alpha blending.
+
+## 5. Culling and Compaction
+
+The key-generation compute pass can apply:
+
+- object-level frustum culling;
+- per-splat XY frustum culling;
+- a configurable frustum slack factor;
+- projected screen-size culling.
+
+Main controls:
+
+```text
+r.GaussianSplat.CullMode 2
+r.GaussianSplat.SplatFrustumSlack 1.3
+r.GaussianSplat.ScreenSizeCull 1
+r.GaussianSplat.ScreenSizeCullMinPixels 1.0
 ```
 
-This does **not** mean that only `4 bit` are sorted. It means each pass processes `4 bit`. For a `uint32` key, the full sort can therefore require up to:
+With DeviceRadix, rejected splats do not enter the active prefix. With the built-in sorter they remain allocated sentinel entries. With stochastic rendering, accepted visible IDs are compacted directly into the draw index buffer.
 
-$$
-32 / 4 = 8
-$$
+`r.GaussianSplat.OpacityAwareBounds` is related but acts later: it shrinks the raster support of low-opacity splats and reduces fragment overdraw, not sort count.
 
-passes.
+## 6. Indirect Arguments
 
-## 4. Sorting Data Structures
+The GPU visible count generates both drawing forms without CPU synchronization:
 
-### 4.1 Global Splat Index Stream
+- indirect indexed-draw arguments for VS + PS;
+- indirect mesh-dispatch arguments for Mesh Shader + PS.
 
-After static data is merged, every splat has a unique `global splat index`. That index addresses:
+This keeps culling, sorting, and draw submission GPU-driven. Geometry-path selection is documented in [Rendering Paths and Performance](RenderingPaths.md).
 
-- global position buffer
-- global color buffer
-- global rotation buffer
-- global scale buffer
-- global normal buffer
-- global SH buffer
+## 7. Performance Guidance
 
-The sorter reorders indices, not the full attribute payload.
+Use DeviceRadix (`SortMethod 1`) as the normal ordered path. Use the built-in sorter only for compatibility or A/B validation. Consider fewer DeviceRadix passes only after checking transparency quality in difficult overlapping views.
 
-### 4.2 Sorting Key
+When profiling, keep the camera, resolution, render mode, culling settings, and geometry mode fixed. Measure the key-generation and sort scopes separately: a lower visible count helps DeviceRadix, while a fragment-bound view may show little total-frame improvement even when sorting is faster.
 
-The key is built from the splat center depth in view space:
+## 8. Summary
 
-$$
-k_i=SortableUint(-z_i)
-$$
-
-where:
-
-- $z_i$ is the view-space depth of splat $i$
-- `SortableUint` converts a float depth into a sortable unsigned-integer representation
-
-See [GaussianSplatCullAndSortKeyGen.usf](../Shaders/GaussianSplatCullAndSortKeyGen.usf):
-
-```hlsl
-OutDepthKeys[globalSplatIndex] = FloatToSortableUint(-viewPos.z);
-```
-
-This directly matches the back-to-front compositing target.
-
-### 4.3 Sorting Value
-
-The value is simply the global splat index itself:
-
-$$
-v_i=i,, i\in[0,N-1]
-$$
-
-See `EnsureIdentityIndexBuffer` in [GaussianSplatSorter.cpp](../Source/GaussianSplatting/Private/GaussianSplatSorter.cpp).
-
-After sorting, the important result is not the reordered key stream but the reordered value stream, which becomes the final:
-
-- `SortedVisibleIndexBuffer`
-
-used by rendering.
-
-## 5. Why the Key / Value Layout Looks Like This
-
-The design follows two principles:
-
-1. keep the sorting input minimal
-2. avoid reordering static attribute buffers every frame
-
-Only depth is needed for the current blending order, so the key stores only depth-related ordering information. Including color, rotation, scale, or other attributes in the key would not improve transparent compositing correctness.
-
-Likewise, full splat attributes are much larger than a single index. Reordering full attribute buffers every frame would be much more expensive than sorting a `uint -> uint` key/value stream and then using the sorted index stream to fetch static data.
-
-This layout also matches UE's `SortGPUBuffers` interface naturally, since that interface is built around key/value streams rather than arbitrary large structs.
-
-## 6. Culling and Key Generation
-
-Before sorting, the implementation performs two GPU culling stages.
-
-### 6.1 Object-Level Culling
-
-The first stage tests each object's local bounds conservatively against the frustum and writes the result into `ObjectVisibilityBuffer`. If the whole object is invisible, all of its splats can be skipped quickly in the next stage.
-
-### 6.2 Per-Splat Culling
-
-The second stage iterates over the global splat stream and checks:
-
-1. object-level visibility
-2. opacity threshold
-3. whether the splat center is in front of the camera
-4. optional per-splat XY frustum conditions
-
-If a splat survives, the shader:
-
-- increments `VisibleCount`
-- writes a normal depth key
-
-If a splat fails, the shader writes:
-
-```hlsl
-0xFFFFFFFFu
-```
-
-as the key, pushing that splat to the tail of the sorted stream. Later, the indirect draw only consumes the first `VisibleCount` splats, so those tail entries are never rasterized.
-
-## 7. GPU Sorting Pass
-
-After culling and key generation, the implementation hands the following to UE's `SortGPUBuffers`:
-
-- ping-pong key buffers
-- ping-pong value buffers
-- the identity value stream
-- the final output value buffer
-
-The key expresses the current view-dependent ordering. The value expresses splat identity. The final sorted output is therefore a reordered global splat index stream.
-
-## 8. Indirect Draw Argument Generation
-
-The visible splat count is not read back to the CPU. Instead, the GPU builds the indirect draw arguments directly from `VisibleCountBuffer[0]`.
-
-Each billboard quad is made of two triangles, so each splat needs 6 vertices:
-
-$$
-VertexCount=VisibleCount\times 6
-$$
-
-See [GaussianSplatCullAndSortKeyGen.usf](../Shaders/GaussianSplatCullAndSortKeyGen.usf):
-
-```hlsl
-OutDrawIndirectArgs[0] = visibleCount * 6u;
-```
-
-The raster pass therefore renders only the first `VisibleCount` splats in the sorted stream.
-
-## 9. How Multi-Object Transparent Occlusion Works
-
-The plugin does not sort and draw each Gaussian object independently. Instead, all splats from all objects are merged into one global stream, globally sorted, and rendered through a merged draw call.
-
-This is the key to correct multi-object transparency. If each object were sorted and drawn independently, only intra-object ordering would be correct. Splats from object A and object B could not interleave correctly in global depth order.
-
-The merged global sort and merged draw solve both:
-
-- correct transparent occlusion between Gaussian objects
-- low draw-call overhead
-
-## 10. Relevant Parameters
-
-The main sorting-related global controls are:
-
-- `r.GaussianSplat.CullMode`
-  - `0`: no culling
-  - `1`: object-level culling only
-  - `2`: object-level plus per-splat XY frustum culling
-
-- `r.GaussianSplat.SplatFrustumSlack`
-  - controls the slack used by per-splat frustum tests
-
-These affect:
-
-- how many splats enter the visible prefix
-- how much useful work the sorter needs to process
-- the tradeoff between aggressive culling and accidental edge clipping
-
-## 11. Summary
-
-The GPU sorting path can be summarized as:
-
-**merge all splats into one global stream; use view-space depth as the key and the global splat index as the value; reuse UE's GPU radix sort to sort that stream; and then drive one merged indirect draw from the visible sorted prefix.**
-
-The key characteristics are:
-
-- the sorted entity is the global splat stream, not an object-local stream
-- keys and values are clearly separated
-- the sorter itself is UE's built-in GPU radix sort
-- the result supports both correct multi-object transparency and draw-call reduction
+- Sorting is global across Gaussian objects.
+- DeviceRadix is the default and sorts only the GPU-generated visible count.
+- The UE built-in path sorts the full allocated stream and remains a compatibility baseline.
+- Stochastic mode skips global depth sorting and relies on temporal reconstruction.
+- No CPU readback is required for active counts or indirect arguments.
+- No Unreal Engine source changes are required.

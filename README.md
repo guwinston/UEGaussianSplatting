@@ -14,6 +14,10 @@ This project demonstrates a practical 3D Gaussian Splatting workflow in Unreal E
 - Integrated `GaussianSplattingRenderer` plugin
 - Import and render 3DGS-style `.ply` files
 - Runtime compressed Gaussian data for lower memory bandwidth pressure
+- GPU-visible-count DeviceRadix sorting; culled splats are not included in radix passes
+- Selectable VS + PS and Mesh Shader + PS geometry paths with automatic VS fallback
+- Screen-size culling and opacity-aware raster bounds for lower geometry and fragment cost
+- Experimental no-sort stochastic splatting with temporal accumulation and camera-motion reprojection
 - GPU-side global splat sorting for correct transparent composition
 - Higher-order spherical harmonics up to degree 3
 - Camera JSON import for viewport alignment and batch capture
@@ -56,5 +60,7 @@ For detailed plugin usage, rendering principles, GPU sorting, and compression no
 - [GaussianSplattingRenderer README](Plugins/GaussianSplattingRenderer/README.md)
 - [Rendering Principles](Plugins/GaussianSplattingRenderer/Docs/RenderingPrinciples.md)
 - [GPU Sorting](Plugins/GaussianSplattingRenderer/Docs/GPUSorting.md)
+- [Rendering Paths and Performance](Plugins/GaussianSplattingRenderer/Docs/RenderingPaths.md)
+- [Stochastic Rendering](Plugins/GaussianSplattingRenderer/Docs/StochasticRendering.md)
 - [Compression](Plugins/GaussianSplattingRenderer/Docs/Compression.md)
 - [Mobile Platform Support](Plugins/GaussianSplattingRenderer/Docs/Mobile.md)

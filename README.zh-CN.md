@@ -14,6 +14,10 @@
 - 已集成 `GaussianSplattingRenderer` 插件
 - 支持导入和渲染 3DGS 风格 `.ply` 文件
 - 使用运行时压缩 Gaussian 数据，降低显存带宽压力
+- 支持按 GPU 实际可见数量执行 DeviceRadix 排序，radix pass 不再处理已剔除 splat
+- 可选择 VS + PS 或 Mesh Shader + PS 几何路径，不支持 Mesh Shader 时自动回退 VS
+- 支持屏幕尺寸剔除与 opacity-aware 光栅包围，降低几何和 fragment 成本
+- 提供实验性的免排序 Stochastic Splat、时域累积与相机运动重投影路径
 - GPU 侧全局 splat 排序，用于正确的半透明合成
 - 支持最高 degree 3 的 higher-order SH
 - 支持导入 `cameras.json`，用于视口对齐和批量截图
@@ -57,5 +61,7 @@ UEGaussianSplatting.uproject          Unreal 项目文件
 - [中文插件文档](Plugins/GaussianSplattingRenderer/Docs/README.zh-CN.md)
 - [渲染原理](Plugins/GaussianSplattingRenderer/Docs/RenderingPrinciples.zh-CN.md)
 - [GPU 排序](Plugins/GaussianSplattingRenderer/Docs/GPUSorting.zh-CN.md)
+- [渲染路径与性能](Plugins/GaussianSplattingRenderer/Docs/RenderingPaths.zh-CN.md)
+- [Stochastic 随机渲染](Plugins/GaussianSplattingRenderer/Docs/StochasticRendering.zh-CN.md)
 - [模型压缩](Plugins/GaussianSplattingRenderer/Docs/Compression.zh-CN.md)
 - [移动端支持](Plugins/GaussianSplattingRenderer/Docs/Mobile.zh-CN.md)

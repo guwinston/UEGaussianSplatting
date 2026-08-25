@@ -14,6 +14,10 @@
 
 - 支持 3DGS 风格 `.ply` 文件的导入与实时渲染
 - 支持 `.ply` 数据压缩，降低模型存储占用，并减轻渲染时的 `memory-bound` 压力
+- 支持按 GPU 可见数量执行 DeviceRadix 排序，并保留 UE 内置 sorter 作为兼容路径
+- 可选择 Vertex Shader 或 Mesh Shader 几何路径，并在不支持 Mesh Shader 时自动回退
+- 支持屏幕尺寸剔除与 opacity-aware bounds，减少无意义几何和 overdraw
+- 提供实验性的免排序 Stochastic Splat、时域累积与运动重投影
 - 支持 GPU 侧 splat 排序，适配大规模高斯点场景
 - 支持最高 3 阶高阶球谐系数，实现视角相关颜色表现
 - 支持导入 `cameras.json`，并将编辑器视口对齐到导入相机
@@ -148,6 +152,16 @@ Saved/GaussianSplatCameraRenders
 当前可用的主要运行时开关：
 
 ```text
+r.GaussianSplat.GeometryMode
+r.GaussianSplat.SortMethod
+r.GaussianSplat.DeviceRadixPasses
+r.GaussianSplat.DeviceRadixWriteFinalKeys
+r.GaussianSplat.ScreenSizeCull
+r.GaussianSplat.ScreenSizeCullMinPixels
+r.GaussianSplat.OpacityAwareBounds
+r.GaussianSplat.StochasticTemporalSamples
+r.GaussianSplat.StochasticReprojection
+r.GaussianSplat.StochasticMotionSamples
 r.GaussianSplat.RasterMode
 r.GaussianSplat.RenderMode
 r.GaussianSplat.EnableHigherOrderSH
@@ -156,6 +170,24 @@ r.GaussianSplat.CullMode
 r.GaussianSplat.SplatFrustumSlack
 ```
 
+- `r.GaussianSplat.GeometryMode`
+  `0` 使用 VS + PS；`1` 请求 Mesh Shader + PS，不支持 Mesh Shader 时自动回退 VS。
+- `r.GaussianSplat.SortMethod`
+  `0` 使用 UE `SortGPUBuffers`，`1` 使用按压缩后可见数量排序的 DeviceRadix（默认），`2` 启用实验性免排序 Stochastic 渲染。
+- `r.GaussianSplat.DeviceRadixPasses`
+  选择 `1` 到 `4` 个 8-bit radix pass。四个 pass 保留完整 32 位 Key；减少 pass 会用排序精度换取更低成本。
+- `r.GaussianSplat.DeviceRadixWriteFinalKeys`
+  默认 `0`，因为光栅化只消费排序后的索引。仅在调试或后续阶段确实需要 Key 时开启。
+- `r.GaussianSplat.ScreenSizeCull` / `r.GaussianSplat.ScreenSizeCullMinPixels`
+  剔除投影尺寸小于像素阈值的 splat。默认启用，阈值为 `1.0` 像素。
+- `r.GaussianSplat.OpacityAwareBounds`
+  缩小低 opacity splat 的包围范围，降低 fragment 与 overdraw，不会扩大原支持半径。
+- `r.GaussianSplat.StochasticTemporalSamples`
+  设置 Stochastic 时域累积上限。`0` 关闭历史，默认值为 `1000`。
+- `r.GaussianSplat.StochasticReprojection`
+  使用逐 splat 相机运动重投影 Stochastic 历史，默认开启。
+- `r.GaussianSplat.StochasticMotionSamples`
+  相机移动时限制有效历史长度以降低拖影，默认值为 `8`。
 - `r.GaussianSplat.RasterMode`
   `0` 为 unit-circle 像素评估，`1` 为 conic / CUDA-like 像素评估。
 - `r.GaussianSplat.RenderMode`
@@ -188,8 +220,10 @@ r.GaussianSplat.SplatFrustumSlack
 2. 将生成的资产拖入关卡后，创建 `AGaussianSplatActor` 与对应的 `UGaussianSplatComponent`，运行时从资产中读取压缩数据。
 3. 在渲染阶段，将多个 Gaussian 对象的压缩数据合并为全局渲染所需的缓冲布局，并上传到 GPU。
 4. 在 `SceneViewExtension` 中结合当前视图、全局 CVar、对象状态与可见性信息，准备本帧渲染参数与相关 GPU 资源。
-5. 通过 GPU 排序流程生成当前视角下的 splat 排序结果，并构建后续绘制所需的索引与间接参数。
-6. 最终进入 Gaussian splat 渲染阶段，与 UE 场景中的其他 Gaussian 对象和常规 Mesh 一起完成遮挡、排序与最终成像。
+5. 压缩可见 splat。默认 DeviceRadix 仅排序 GPU 可见数量；Stochastic 模式跳过排序并直接写入可见索引。
+6. 生成 indirect 参数，通过 VS + PS 或在平台支持且被选中时通过 Mesh Shader + PS 光栅化。
+7. Stochastic 模式对接受样本做时域累积，并可使用逐 splat 相机运动重投影历史。
+8. 与 UE 场景合成，处理 Gaussian 之间以及 Gaussian 与普通 UE Mesh 之间的遮挡。
 
 ## 详细文档
 
@@ -197,13 +231,16 @@ r.GaussianSplat.SplatFrustumSlack
 
 - [渲染原理](RenderingPrinciples.zh-CN.md)
 - [GPU 排序](GPUSorting.zh-CN.md)
+- [渲染路径与性能](RenderingPaths.zh-CN.md)
+- [Stochastic 随机渲染](StochasticRendering.zh-CN.md)
 - [模型压缩](Compression.zh-CN.md)
+- [移动端支持](Mobile.zh-CN.md)
 
 其中包括：
 
 - 3DGS 到 UE 的坐标系转换
 - 3D Gaussian 到 2D 椭圆投影
-- VS / PS 的职责划分
+- VS / Mesh Shader / PS 的职责划分
 - `RASTER_MODE=0/1` 的等价求值方式
 - alpha blending 与排序方向
 - Gaussian 与 Gaussian、Gaussian 与 UE Mesh 的遮挡关系

@@ -14,6 +14,10 @@ At 1080p on an RTX 5060 Ti, measured results show that small objects with hundre
 
 - Import and render 3DGS-style `.ply` files
 - Compress `.ply` data to reduce model storage and memory-bound rendering pressure
+- DeviceRadix sorting over the GPU-generated visible count, with UE's built-in sorter as a compatibility path
+- Selectable vertex-shader and mesh-shader geometry paths with automatic fallback
+- Screen-size culling and opacity-aware bounds to reduce insignificant geometry and overdraw
+- Experimental no-sort stochastic splatting with temporal accumulation and motion reprojection
 - GPU-side splat sorting for large Gaussian scenes
 - Higher-order spherical harmonics up to degree 3 for view-dependent color
 - Import `cameras.json` and align the editor viewport to imported cameras
@@ -148,6 +152,16 @@ On `UGaussianSplatComponent`:
 Useful runtime controls:
 
 ```text
+r.GaussianSplat.GeometryMode
+r.GaussianSplat.SortMethod
+r.GaussianSplat.DeviceRadixPasses
+r.GaussianSplat.DeviceRadixWriteFinalKeys
+r.GaussianSplat.ScreenSizeCull
+r.GaussianSplat.ScreenSizeCullMinPixels
+r.GaussianSplat.OpacityAwareBounds
+r.GaussianSplat.StochasticTemporalSamples
+r.GaussianSplat.StochasticReprojection
+r.GaussianSplat.StochasticMotionSamples
 r.GaussianSplat.RasterMode
 r.GaussianSplat.RenderMode
 r.GaussianSplat.EnableHigherOrderSH
@@ -156,6 +170,24 @@ r.GaussianSplat.CullMode
 r.GaussianSplat.SplatFrustumSlack
 ```
 
+- `r.GaussianSplat.GeometryMode`
+  `0` uses VS + PS; `1` requests Mesh Shader + PS and automatically falls back to VS when mesh shaders are unavailable.
+- `r.GaussianSplat.SortMethod`
+  `0` uses UE `SortGPUBuffers`, `1` uses DeviceRadix over the compacted visible count (default), and `2` enables experimental no-sort stochastic rendering.
+- `r.GaussianSplat.DeviceRadixPasses`
+  Selects `1` to `4` 8-bit radix passes. Four passes preserve the full 32-bit ordering key; fewer passes trade ordering precision for sort cost.
+- `r.GaussianSplat.DeviceRadixWriteFinalKeys`
+  Defaults to `0` because rasterization consumes sorted indices only. Enable final key output only for diagnostics or a downstream consumer.
+- `r.GaussianSplat.ScreenSizeCull` / `r.GaussianSplat.ScreenSizeCullMinPixels`
+  Discards splats whose projected extent is below the configured pixel threshold. The defaults are enabled and `1.0` pixel.
+- `r.GaussianSplat.OpacityAwareBounds`
+  Shrinks low-opacity splat bounds to reduce fragments and overdraw without expanding the original support radius.
+- `r.GaussianSplat.StochasticTemporalSamples`
+  Sets the temporal accumulation limit for stochastic rendering. `0` disables history; the default is `1000`.
+- `r.GaussianSplat.StochasticReprojection`
+  Reprojects stochastic history using per-splat camera motion. Enabled by default.
+- `r.GaussianSplat.StochasticMotionSamples`
+  Caps effective history while the camera moves to limit ghosting. The default is `8`.
 - `r.GaussianSplat.RasterMode`
   `0` uses unit-circle pixel evaluation, while `1` uses conic / CUDA-like pixel evaluation.
 - `r.GaussianSplat.RenderMode`
@@ -188,8 +220,10 @@ The main runtime data flow is:
 2. Drag the generated asset into a level to create an `AGaussianSplatActor` and its `UGaussianSplatComponent`, which read the compressed asset data at runtime.
 3. Merge compressed data from multiple Gaussian objects into the global buffer layout required by the renderer, then upload those buffers to the GPU.
 4. Inside the `SceneViewExtension`, combine the current view, global CVars, object state, and visibility data to prepare per-frame render parameters and GPU resources.
-5. Run the GPU sorting path to produce view-dependent splat ordering and the index / indirect draw data needed by the renderer.
-6. Execute the final Gaussian splat rendering pass, integrating with UE scene rendering so Gaussian objects can occlude one another and interact correctly with regular UE meshes.
+5. Compact visible splats. The default DeviceRadix path sorts only the GPU visible count; stochastic mode skips sorting and writes visible indices directly.
+6. Generate indirect arguments and rasterize through VS + PS or, when supported and selected, Mesh Shader + PS.
+7. In stochastic mode, temporally accumulate accepted samples and optionally reproject history using per-splat camera motion.
+8. Composite with UE scene rendering so Gaussian objects occlude one another and interact correctly with regular UE meshes.
 
 ## Detailed Docs
 
@@ -197,13 +231,16 @@ For a deeper explanation of the rendering math and shader-side implementation de
 
 - [Rendering Principles](Docs/RenderingPrinciples.md)
 - [GPU Sorting](Docs/GPUSorting.md)
+- [Rendering Paths and Performance](Docs/RenderingPaths.md)
+- [Stochastic Rendering](Docs/StochasticRendering.md)
 - [Compression](Docs/Compression.md)
+- [Mobile Platform Support](Docs/Mobile.md)
 
 This document covers:
 
 - source 3DGS to UE coordinate conversion
 - 3D Gaussian projection into a 2D ellipse
-- VS / PS responsibility split
+- VS / Mesh Shader / PS responsibility split
 - the equivalent `RASTER_MODE=0/1` evaluation paths
 - alpha blending and sort direction
 - occlusion between Gaussian objects and between Gaussian objects and UE meshes

@@ -6,8 +6,10 @@
 
 - 3DGS 数据在当前渲染路径中的坐标系约定
 - 3D Gaussian 从 3D 空间投影到 2D 屏幕空间的过程
-- 顶点着色器与像素着色器分别完成的工作
+- Vertex/Mesh 几何阶段与像素着色器分别完成的工作
 - alpha 计算、alpha blending 与最终合成的具体方式
+
+下文使用 VS 路径解释 quad 扩展的数学过程。Mesh Shader 路径执行相同的逐 splat 解码、投影、椭圆构造与 PS 数据交接，只是通过 mesh dispatch 生成图元。路径选择、自动回退和性能测试方法见 [渲染路径与性能](RenderingPaths.zh-CN.md)。
 
 
 ## 1. 总体渲染路径

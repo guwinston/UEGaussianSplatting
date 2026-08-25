@@ -6,8 +6,10 @@ This document focuses only on the rendering path used by the plugin, including:
 
 - coordinate-system conventions for 3DGS data inside the current renderer
 - projection of a 3D Gaussian from 3D space into 2D screen space
-- the work done by the vertex shader and pixel shader
+- the work done by the vertex/mesh geometry stage and pixel shader
 - alpha evaluation, alpha blending, and final compositing
+
+The math below uses the VS path to explain quad expansion. The Mesh Shader path performs the same per-splat decode, projection, ellipse construction, and PS handoff while generating primitives through mesh dispatch. See [Rendering Paths and Performance](RenderingPaths.md) for selection, fallback, and profiling guidance.
 
 ## 1. Overall Rendering Path
 
