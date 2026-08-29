@@ -6,6 +6,7 @@
 #include "ShaderParameterStruct.h"
 #include "ShaderParameterMacros.h"
 #include "RHICommandList.h"
+#include "DataDrivenShaderPlatformInfo.h"
 #include "ShaderPermutation.h"
 #include "SceneView.h"
 
@@ -75,6 +76,7 @@ class GAUSSIANSPLATTING_API FGaussianBuildSortKeysCS : public FGlobalShader
         SHADER_PARAMETER(float, MaxFocalLengthPixels)
         SHADER_PARAMETER(FMatrix44f, WorldToView)
         SHADER_PARAMETER(uint32, CompactVisibleOutput)
+        SHADER_PARAMETER(uint32, FrontToBackSort)
         SHADER_PARAMETER_UAV(RWBuffer<uint32>, OutDepthKeys)
         SHADER_PARAMETER_UAV(RWBuffer<uint32>, OutSortValues)
         SHADER_PARAMETER_UAV(RWBuffer<uint32>, OutVisibleCount)
@@ -437,6 +439,7 @@ class GAUSSIANSPLATTING_API FGaussianSplatCompositePS : public FGlobalShader
         SHADER_PARAMETER_RDG_TEXTURE(Texture2D, GaussianAccumTexture)
         SHADER_PARAMETER(float, PreExposure)
         SHADER_PARAMETER(uint32, ConvertOutputToLinear)
+        SHADER_PARAMETER(uint32, TransmittanceAccumulation)
         SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
     END_SHADER_PARAMETER_STRUCT()
 
@@ -445,6 +448,22 @@ class GAUSSIANSPLATTING_API FGaussianSplatCompositePS : public FGlobalShader
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {
         return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::ES3_1);
+    }
+};
+
+class GAUSSIANSPLATTING_API FGaussianSplatTransmittanceStencilPS : public FGlobalShader
+{
+    DECLARE_GLOBAL_SHADER(FGaussianSplatTransmittanceStencilPS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatTransmittanceStencilPS, FGlobalShader);
+
+    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, GaussianAccumTexture)
+        SHADER_PARAMETER(float, TransmittanceThreshold)
+    END_SHADER_PARAMETER_STRUCT()
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
     }
 };
 
@@ -484,6 +503,11 @@ END_SHADER_PARAMETER_STRUCT()
 
 BEGIN_SHADER_PARAMETER_STRUCT(FGaussianSplatCompositePassParameters, )
     SHADER_PARAMETER_STRUCT_INCLUDE(FGaussianSplatCompositePS::FParameters, PS)
+    RENDER_TARGET_BINDING_SLOTS()
+END_SHADER_PARAMETER_STRUCT()
+
+BEGIN_SHADER_PARAMETER_STRUCT(FGaussianSplatTransmittanceStencilPassParameters, )
+    SHADER_PARAMETER_STRUCT_INCLUDE(FGaussianSplatTransmittanceStencilPS::FParameters, PS)
     RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
 

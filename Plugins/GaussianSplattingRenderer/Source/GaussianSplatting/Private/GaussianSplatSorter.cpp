@@ -12,6 +12,19 @@
 #include "RenderGraphUtils.h"
 #include "ShaderParameterUtils.h"
 #include "DeviceRadixSort.h"
+#include "Misc/EngineVersionComparison.h"
+#include "ProfilingDebugging/RealtimeGPUProfiler.h"
+
+#if UE_VERSION_OLDER_THAN(5, 5, 0)
+    #ifndef RDG_EVENT_SCOPE_STAT
+        #define RDG_EVENT_SCOPE_STAT(GraphBuilder, StatName, Format, ...) \
+            RDG_EVENT_SCOPE(GraphBuilder, Format, ##__VA_ARGS__)
+    #endif
+    #ifndef RHI_BREADCRUMB_EVENT_STAT
+        #define RHI_BREADCRUMB_EVENT_STAT(RHICmdList, StatName, Format, ...) \
+            SCOPED_GPU_STAT(RHICmdList, StatName)
+    #endif
+#endif
 
 DECLARE_GPU_STAT_NAMED(GaussianSplatObjectCull, TEXT("Gaussian Splat Object Cull"));
 DECLARE_GPU_STAT_NAMED(GaussianSplatSortKeyGen, TEXT("Gaussian Splat Sort Key Gen"));
@@ -279,6 +292,7 @@ int32 FGaussianSplatSorter::GetSortConfigSignature()
     Signature = HashCombine(Signature, GetTypeHash(GaussianSplatCVars::GetScreenSizeCullOnAnyThread()));
     Signature = HashCombine(Signature, GetTypeHash(GaussianSplatCVars::GetScreenSizeCullMinPixelsOnAnyThread()));
     Signature = HashCombine(Signature, GetTypeHash(GaussianSplatCVars::GetSortMethodOnRenderThread()));
+    Signature = HashCombine(Signature, GetTypeHash(GaussianSplatCVars::GetTransmittanceStencilOnAnyThread()));
     Signature = HashCombine(Signature, GetTypeHash(GaussianSplatCVars::GetDeviceRadixPassCountOnRenderThread()));
     Signature = HashCombine(Signature, GetTypeHash(GaussianSplatCVars::GetDeviceRadixWriteFinalKeysOnRenderThread()));
     return static_cast<int32>(Signature);
@@ -523,6 +537,9 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
         Parameters.MaxFocalLengthPixels = RequestedMaxFocalLengthPixels;
         Parameters.WorldToView = RequestedWorldToView;
         Parameters.CompactVisibleOutput = bUseStochasticSplat ? 2u : (bUseDeviceRadixSort ? 1u : 0u);
+        Parameters.FrontToBackSort =
+            GaussianSplatCVars::GetTransmittanceStencilOnAnyThread() != 0
+            && !bUseStochasticSplat ? 1u : 0u;
         Parameters.OutDepthKeys = GPUSortKeyUAV[0];
         Parameters.OutSortValues = bUseStochasticSplat ? SortedIndexUAV : GPUSortValueUAV[0];
         Parameters.OutVisibleCount = VisibleCountUAV;

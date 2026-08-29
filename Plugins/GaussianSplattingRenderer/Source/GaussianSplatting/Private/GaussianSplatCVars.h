@@ -15,6 +15,10 @@ namespace GaussianSplatCVars
     int32 GetPrecomputeModeOnRenderThread();
     /** 0 = monolithic; otherwise reusable sorted precompute chunk capacity. */
     int32 GetPrecomputeChunkSplatsOnRenderThread();
+    /** Front-to-back chunked blending with stencil rejection of saturated pixels. */
+    int32 GetTransmittanceStencilOnAnyThread();
+    int32 GetTransmittanceChunksOnRenderThread();
+    float GetTransmittanceThresholdOnRenderThread();
 
     int32 GetCullModeOnAnyThread();
     int32 GetForceSortEveryFrameOnAnyThread();
