@@ -105,6 +105,8 @@ class GAUSSIANSPLATTING_API FGaussianBuildIndirectArgsCS : public FGlobalShader
 
     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
         SHADER_PARAMETER_SRV(Buffer<uint32>, VisibleCountBuffer)
+        SHADER_PARAMETER(uint32, DrawSplatOffset)
+        SHADER_PARAMETER(uint32, DrawSplatCapacity)
         SHADER_PARAMETER_UAV(RWBuffer<uint32>, OutDrawIndirectArgs)
     END_SHADER_PARAMETER_STRUCT()
 
@@ -122,6 +124,96 @@ class GAUSSIANSPLATTING_API FGaussianBuildIndirectArgsCS : public FGlobalShader
     }
 };
 
+// RDG-tracked variant used between each precompute chunk and its raster pass.
+class GAUSSIANSPLATTING_API FGaussianBuildChunkIndirectArgsCS : public FGlobalShader
+{
+    DECLARE_GLOBAL_SHADER(FGaussianBuildChunkIndirectArgsCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianBuildChunkIndirectArgsCS, FGlobalShader);
+
+    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, VisibleCountBuffer)
+        SHADER_PARAMETER(uint32, DrawSplatOffset)
+        SHADER_PARAMETER(uint32, DrawSplatCapacity)
+        SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutDrawIndirectArgs)
+    END_SHADER_PARAMETER_STRUCT()
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+
+    static void ModifyCompilationEnvironment(
+        const FGlobalShaderPermutationParameters& Parameters,
+        FShaderCompilerEnvironment& OutEnvironment)
+    {
+        FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+        OutEnvironment.SetDefine(TEXT("THREAD_GROUP_SIZE"), 1);
+    }
+};
+
+// ============================================================
+//  Visible-splat projection precompute
+//
+//  Runs once per visible splat and stores four float4 records, plus one
+//  stochastic-only reprojection record:
+//    0: NDC center.xyz, Gaussian support extent
+//    1: projected basis X.xy, projected basis Y.xy
+//    2: color.rgba
+//    3: conic.xyz, global splat index as float bits
+//    4: previousUV-currentUV.xy, reprojection validity (stochastic only)
+// ============================================================
+class GAUSSIANSPLATTING_API FGaussianSplatPrecomputeCS : public FGlobalShader
+{
+    DECLARE_GLOBAL_SHADER(FGaussianSplatPrecomputeCS);
+    SHADER_USE_PARAMETER_STRUCT(FGaussianSplatPrecomputeCS, FGlobalShader);
+
+    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, GlobalPackedPositionBuffer)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, GlobalPackedColorBuffer)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, GlobalPackedRotationBuffer)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, GlobalPackedScaleBuffer)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, GlobalPackedSHDataBuffer)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, GlobalSHCodebookBuffer)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, GlobalChunkPositionMinBuffer)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, GlobalChunkPositionMaxBuffer)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, GlobalObjectIndexBuffer)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, PerObjectBuffer)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SortedVisibleIndexBuffer)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, VisibleCountBuffer)
+        SHADER_PARAMETER(FMatrix44f, WorldToView)
+        SHADER_PARAMETER(FMatrix44f, ViewToClip)
+        SHADER_PARAMETER(FMatrix44f, PreviousWorldToClip)
+        SHADER_PARAMETER(FVector3f, CameraPosition)
+        SHADER_PARAMETER(FVector2f, FocalLength)
+        SHADER_PARAMETER(FVector2f, ViewportMin)
+        SHADER_PARAMETER(FVector2f, ViewportSize)
+        SHADER_PARAMETER(int32, TotalSplatCount)
+        SHADER_PARAMETER(int32, ObjectCount)
+        SHADER_PARAMETER(uint32, PrecomputeVisibleOffset)
+        SHADER_PARAMETER(uint32, PrecomputeDispatchOffset)
+        SHADER_PARAMETER(uint32, PrecomputeChunkSplatCount)
+        SHADER_PARAMETER(uint32, PrecomputeRecordFloat4s)
+        SHADER_PARAMETER(uint32, EnableAntialiasing)
+        SHADER_PARAMETER(uint32, EnableOpacityAwareBounds)
+        SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, OutPrecomputedSplatBuffer)
+    END_SHADER_PARAMETER_STRUCT()
+
+    using FPermutationDomain = TShaderPermutationDomain<>;
+
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    {
+        return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+    }
+
+    static void ModifyCompilationEnvironment(
+        const FGlobalShaderPermutationParameters& Parameters,
+        FShaderCompilerEnvironment& OutEnvironment)
+    {
+        FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+        OutEnvironment.SetDefine(TEXT("PRECOMPUTE_GROUP_SIZE"), 64);
+    }
+};
+
 // ============================================================
 //  3DGS Shader Permutation Dimensions
 // ============================================================
@@ -130,6 +222,11 @@ class FGaussianSplatRasterModeDim : SHADER_PERMUTATION_INT("RASTER_MODE", 2);
 class FGaussianSplatStochasticDim : SHADER_PERMUTATION_BOOL("STOCHASTIC_SPLAT");
 using FGaussianSplatRasterPermutationDomain = TShaderPermutationDomain<
     FGaussianSplatRasterModeDim, FGaussianSplatStochasticDim>;
+class FGaussianSplatPrecomputedDim : SHADER_PERMUTATION_BOOL("PRECOMPUTED_SPLAT");
+using FGaussianSplatVSPrecomputePermutationDomain = TShaderPermutationDomain<
+    FGaussianSplatRasterModeDim,
+    FGaussianSplatStochasticDim,
+    FGaussianSplatPrecomputedDim>;
 
 // ============================================================
 //  Per-Object GPU Descriptor
@@ -214,6 +311,7 @@ class GAUSSIANSPLATTING_API FGaussianSplatVS : public FGlobalShader
         SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, PerObjectBuffer)
         SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, SortedVisibleIndexBuffer)
         SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, VisibleCountBuffer)
+        SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, PrecomputedSplatBuffer)
 
         SHADER_PARAMETER(FMatrix44f, WorldToView)
         SHADER_PARAMETER(FMatrix44f, ViewToClip)
@@ -225,13 +323,15 @@ class GAUSSIANSPLATTING_API FGaussianSplatVS : public FGlobalShader
 
         SHADER_PARAMETER(int32, TotalSplatCount)
         SHADER_PARAMETER(int32, ObjectCount)
+        SHADER_PARAMETER(uint32, PrecomputeVisibleOffset)
+        SHADER_PARAMETER(uint32, PrecomputeRecordFloat4s)
         SHADER_PARAMETER(uint32, EnableAntialiasing)
         SHADER_PARAMETER(uint32, EnableOpacityAwareBounds)
         SHADER_PARAMETER(float, PreExposure)
         SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
     END_SHADER_PARAMETER_STRUCT()
 
-    using FPermutationDomain = FGaussianSplatRasterPermutationDomain;
+    using FPermutationDomain = FGaussianSplatVSPrecomputePermutationDomain;
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {
@@ -258,7 +358,7 @@ class GAUSSIANSPLATTING_API FGaussianSplatMS : public FGlobalShader
     using FParameters = FGaussianSplatVS::FParameters;
     SHADER_USE_PARAMETER_STRUCT(FGaussianSplatMS, FGlobalShader);
 
-    using FPermutationDomain = FGaussianSplatVS::FPermutationDomain;
+    using FPermutationDomain = FGaussianSplatRasterPermutationDomain;
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     {

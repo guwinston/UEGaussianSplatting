@@ -12,6 +12,9 @@ namespace GaussianSplatCVars
     int32 GetOpacityAwareBoundsOnRenderThread();
     /** Geometry backend: 0 = VS+PS, 1 = MS+PS (falls back to VS when unsupported). */
     int32 GetGeometryModeOnRenderThread();
+    int32 GetPrecomputeModeOnRenderThread();
+    /** 0 = monolithic; otherwise reusable sorted precompute chunk capacity. */
+    int32 GetPrecomputeChunkSplatsOnRenderThread();
 
     int32 GetCullModeOnAnyThread();
     int32 GetForceSortEveryFrameOnAnyThread();

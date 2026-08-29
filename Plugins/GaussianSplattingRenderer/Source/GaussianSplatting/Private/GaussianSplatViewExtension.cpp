@@ -34,6 +34,7 @@ DECLARE_GPU_STAT_NAMED(GaussianSplat, TEXT("Gaussian Splat"));
 DECLARE_GPU_STAT_NAMED(GaussianSplatAccumulate, TEXT("Gaussian Splat Accumulate"));
 DECLARE_GPU_STAT_NAMED(GaussianSplatComposite, TEXT("Gaussian Splat Composite"));
 DECLARE_GPU_STAT_NAMED(GaussianSplatDirect, TEXT("Gaussian Splat Direct"));
+DECLARE_GPU_STAT_NAMED(GaussianSplatPrecompute, TEXT("Gaussian Splat Precompute"));
 
 // File-local helpers used by this view extension, including small utility
 // functions and transient data structures for resolving view/light state.
@@ -72,6 +73,323 @@ static FScreenPassTexture CreateWritablePostProcessSceneColor(
 #else
     return FScreenPassTexture::CopyFromSlice(GraphBuilder, SceneColorSlice, Output);
 #endif
+}
+
+struct FGaussianSplatRasterPassContext
+{
+    TShaderRef<FGaussianSplatVS> VertexShader;
+    TShaderRef<FGaussianSplatMS> MeshShader;
+    TShaderRef<FGaussianSplatPS> PixelShader;
+    float ViewMinX = 0.0f;
+    float ViewMinY = 0.0f;
+    float ViewMaxX = 0.0f;
+    float ViewMaxY = 0.0f;
+    bool bCompositeToUELinear = false;
+    bool bUseManualSceneDepthTest = false;
+    bool bUseMeshShader = false;
+    bool bUseStochasticSplat = false;
+    bool bHasSceneDepth = false;
+};
+
+static void AddGaussianSplatRasterPass(
+    FRDGBuilder& GraphBuilder,
+    const FGaussianSplatRasterPassContext& Context,
+    const TCHAR* PassName,
+    FGaussianSplatPassParameters* PassParameters,
+    int32 ChunkIndex)
+{
+    const TCHAR* GeometryBackendName = Context.bUseMeshShader ? TEXT("MS") : TEXT("VS");
+    const TShaderRef<FGaussianSplatVS> VertexShader = Context.VertexShader;
+    const TShaderRef<FGaussianSplatMS> MeshShader = Context.MeshShader;
+    const TShaderRef<FGaussianSplatPS> PixelShader = Context.PixelShader;
+    const float ViewMinX = Context.ViewMinX;
+    const float ViewMinY = Context.ViewMinY;
+    const float ViewMaxX = Context.ViewMaxX;
+    const float ViewMaxY = Context.ViewMaxY;
+    const bool bCompositeToUELinear = Context.bCompositeToUELinear;
+    const bool bUseManualSceneDepthTest = Context.bUseManualSceneDepthTest;
+    const bool bUseMeshShader = Context.bUseMeshShader;
+    const bool bUseStochasticSplat = Context.bUseStochasticSplat;
+    const bool bHasSceneDepth = Context.bHasSceneDepth;
+
+    GraphBuilder.AddPass(
+        RDG_EVENT_NAME("%s_%s_Chunk%d", PassName, GeometryBackendName, ChunkIndex),
+        PassParameters,
+        ERDGPassFlags::Raster,
+        [VertexShader, MeshShader, PixelShader, PassParameters,
+         ViewMinX, ViewMinY, ViewMaxX, ViewMaxY,
+         bCompositeToUELinear, bUseManualSceneDepthTest,
+         bUseMeshShader, bUseStochasticSplat, bHasSceneDepth]
+        (FRHICommandList& RHICmdList)
+        {
+            FGraphicsPipelineStateInitializer PSOInit;
+            RHICmdList.ApplyCachedRenderTargets(PSOInit);
+
+            PSOInit.DepthStencilState = bUseStochasticSplat
+                ? TStaticDepthStencilState<true, CF_DepthNearOrEqual>::GetRHI()
+                : (bHasSceneDepth && !bUseManualSceneDepthTest)
+                ? TStaticDepthStencilState<false, CF_DepthNearOrEqual>::GetRHI()
+                : TStaticDepthStencilState<false, CF_Always>::GetRHI();
+            if (bCompositeToUELinear || bUseStochasticSplat)
+            {
+                PSOInit.BlendState = TStaticBlendState<
+                    CW_RGBA,
+                    BO_Add, BF_One, BF_InverseSourceAlpha,
+                    BO_Add, BF_One, BF_InverseSourceAlpha>::GetRHI();
+            }
+            else
+            {
+                PSOInit.BlendState = TStaticBlendState<
+                    CW_RGB,
+                    BO_Add, BF_One, BF_InverseSourceAlpha,
+                    BO_Add, BF_One, BF_InverseSourceAlpha>::GetRHI();
+            }
+            PSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+
+            if (bUseMeshShader)
+            {
+                PSOInit.BoundShaderState.SetMeshShader(MeshShader.GetMeshShader());
+            }
+            else
+            {
+                PSOInit.BoundShaderState.VertexDeclarationRHI =
+                    GEmptyVertexDeclaration.VertexDeclarationRHI;
+                PSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
+            }
+            PSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
+            PSOInit.PrimitiveType = PT_TriangleList;
+
+            SetGraphicsPipelineState(RHICmdList, PSOInit, 0);
+            RHICmdList.SetViewport(
+                ViewMinX, ViewMinY, 0.0f, ViewMaxX, ViewMaxY, 1.0f);
+
+            if (bUseMeshShader)
+            {
+                SetShaderParameters(
+                    RHICmdList, MeshShader, MeshShader.GetMeshShader(), PassParameters->VS);
+            }
+            else
+            {
+                SetShaderParameters(
+                    RHICmdList, VertexShader, VertexShader.GetVertexShader(), PassParameters->VS);
+            }
+            SetShaderParameters(
+                RHICmdList, PixelShader, PixelShader.GetPixelShader(), PassParameters->PS);
+
+            if (bUseMeshShader)
+            {
+                RHICmdList.DispatchIndirectMeshShader(
+                    PassParameters->DrawIndirectArgsBuffer->GetIndirectRHICallBuffer(),
+                    sizeof(FRHIDrawIndirectParameters));
+            }
+            else
+            {
+                RHICmdList.DrawPrimitiveIndirect(
+                    PassParameters->DrawIndirectArgsBuffer->GetIndirectRHICallBuffer(), 0);
+            }
+        });
+}
+
+struct FGaussianSplatPrecomputePassContext
+{
+    TShaderRef<FGaussianSplatPrecomputeCS> PrecomputeShader;
+    TShaderRef<FGaussianBuildChunkIndirectArgsCS> ChunkIndirectArgsShader;
+    FGaussianSplatPassParameters* BasePassParameters = nullptr;
+
+    FRDGBufferSRVRef PackedPositionSRV = nullptr;
+    FRDGBufferSRVRef PackedColorSRV = nullptr;
+    FRDGBufferSRVRef PackedRotationSRV = nullptr;
+    FRDGBufferSRVRef PackedScaleSRV = nullptr;
+    FRDGBufferSRVRef PackedSHDataSRV = nullptr;
+    FRDGBufferSRVRef SHCodebookSRV = nullptr;
+    FRDGBufferSRVRef ChunkPositionMinSRV = nullptr;
+    FRDGBufferSRVRef ChunkPositionMaxSRV = nullptr;
+    FRDGBufferSRVRef ObjectIndexSRV = nullptr;
+    FRDGBufferSRVRef PerObjectSRV = nullptr;
+    FRDGBufferSRVRef SortedIndexSRV = nullptr;
+    FRDGBufferSRVRef VisibleCountSRV = nullptr;
+    FRDGBufferUAVRef PrecomputedSplatUAV = nullptr;
+    FRDGBufferRef ChunkIndirectArgsBuffer = nullptr;
+    FRDGBufferUAVRef ChunkIndirectArgsUAV = nullptr;
+
+    FRDGTextureRef StochasticMotionTexture = nullptr;
+    FRDGTextureRef StochasticDepthTexture = nullptr;
+
+    FMatrix44f WorldToView;
+    FMatrix44f ViewToClip;
+    FMatrix44f PreviousWorldToClip;
+    FVector3f CameraPosition = FVector3f::ZeroVector;
+    FVector2f FocalLength = FVector2f::ZeroVector;
+    FVector2f ViewportMin = FVector2f::ZeroVector;
+    FVector2f ViewportSize = FVector2f::ZeroVector;
+
+    int32 TotalSplatCount = 0;
+    int32 ObjectCount = 0;
+    uint32 ChunkCapacity = 0u;
+    uint32 RecordFloat4s = 0u;
+    uint32 EnableAntialiasing = 0u;
+    uint32 EnableOpacityAwareBounds = 0u;
+    bool bUsePrecomputedSplats = false;
+    bool bUseStochasticSplat = false;
+};
+
+static void AddGaussianSplatRasterPasses(
+    FRDGBuilder& GraphBuilder,
+    const FGaussianSplatRasterPassContext& RasterContext,
+    const FGaussianSplatPrecomputePassContext& PrecomputeContext,
+    const TCHAR* PassName)
+{
+    if (!PrecomputeContext.bUsePrecomputedSplats)
+    {
+        AddGaussianSplatRasterPass(
+            GraphBuilder,
+            RasterContext,
+            PassName,
+            PrecomputeContext.BasePassParameters,
+            0);
+        return;
+    }
+
+    static constexpr uint32 PrecomputeGroupSize = 64u;
+    const uint32 MaxGroupsPerDispatch = FMath::Max(
+        1u,
+        static_cast<uint32>(GRHIGlobals.MaxDispatchThreadGroupsPerDimension.X));
+    const uint32 TotalSplatCount =
+        static_cast<uint32>(PrecomputeContext.TotalSplatCount);
+    const uint32 ChunkCount =
+        FMath::DivideAndRoundUp(TotalSplatCount, PrecomputeContext.ChunkCapacity);
+
+    for (uint32 ChunkIndex = 0u; ChunkIndex < ChunkCount; ++ChunkIndex)
+    {
+        const uint32 ChunkVisibleOffset =
+            ChunkIndex * PrecomputeContext.ChunkCapacity;
+        const uint32 ChunkSplatCount = FMath::Min(
+            PrecomputeContext.ChunkCapacity,
+            TotalSplatCount - ChunkVisibleOffset);
+
+        {
+            RDG_EVENT_SCOPE_STAT(
+                GraphBuilder,
+                GaussianSplatPrecompute,
+                "GaussianSplat_PrecomputeChunk");
+            RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplatPrecompute);
+
+            for (uint32 DispatchOffset = 0u;
+                 DispatchOffset < ChunkSplatCount;)
+            {
+                const uint32 RemainingSplats = ChunkSplatCount - DispatchOffset;
+                const uint32 RemainingGroups =
+                    FMath::DivideAndRoundUp(RemainingSplats, PrecomputeGroupSize);
+                const uint32 GroupCount =
+                    FMath::Min(RemainingGroups, MaxGroupsPerDispatch);
+
+                FGaussianSplatPrecomputeCS::FParameters* Parameters =
+                    GraphBuilder.AllocParameters<FGaussianSplatPrecomputeCS::FParameters>();
+                Parameters->GlobalPackedPositionBuffer =
+                    PrecomputeContext.PackedPositionSRV;
+                Parameters->GlobalPackedColorBuffer =
+                    PrecomputeContext.PackedColorSRV;
+                Parameters->GlobalPackedRotationBuffer =
+                    PrecomputeContext.PackedRotationSRV;
+                Parameters->GlobalPackedScaleBuffer =
+                    PrecomputeContext.PackedScaleSRV;
+                Parameters->GlobalPackedSHDataBuffer =
+                    PrecomputeContext.PackedSHDataSRV;
+                Parameters->GlobalSHCodebookBuffer =
+                    PrecomputeContext.SHCodebookSRV;
+                Parameters->GlobalChunkPositionMinBuffer =
+                    PrecomputeContext.ChunkPositionMinSRV;
+                Parameters->GlobalChunkPositionMaxBuffer =
+                    PrecomputeContext.ChunkPositionMaxSRV;
+                Parameters->GlobalObjectIndexBuffer =
+                    PrecomputeContext.ObjectIndexSRV;
+                Parameters->PerObjectBuffer = PrecomputeContext.PerObjectSRV;
+                Parameters->SortedVisibleIndexBuffer =
+                    PrecomputeContext.SortedIndexSRV;
+                Parameters->VisibleCountBuffer =
+                    PrecomputeContext.VisibleCountSRV;
+                Parameters->WorldToView = PrecomputeContext.WorldToView;
+                Parameters->ViewToClip = PrecomputeContext.ViewToClip;
+                Parameters->PreviousWorldToClip =
+                    PrecomputeContext.PreviousWorldToClip;
+                Parameters->CameraPosition = PrecomputeContext.CameraPosition;
+                Parameters->FocalLength = PrecomputeContext.FocalLength;
+                Parameters->ViewportMin = PrecomputeContext.ViewportMin;
+                Parameters->ViewportSize = PrecomputeContext.ViewportSize;
+                Parameters->TotalSplatCount =
+                    PrecomputeContext.TotalSplatCount;
+                Parameters->ObjectCount = PrecomputeContext.ObjectCount;
+                Parameters->PrecomputeVisibleOffset = ChunkVisibleOffset;
+                Parameters->PrecomputeDispatchOffset = DispatchOffset;
+                Parameters->PrecomputeChunkSplatCount = ChunkSplatCount;
+                Parameters->PrecomputeRecordFloat4s =
+                    PrecomputeContext.RecordFloat4s;
+                Parameters->EnableAntialiasing =
+                    PrecomputeContext.EnableAntialiasing;
+                Parameters->EnableOpacityAwareBounds =
+                    PrecomputeContext.EnableOpacityAwareBounds;
+                Parameters->OutPrecomputedSplatBuffer =
+                    PrecomputeContext.PrecomputedSplatUAV;
+
+                FComputeShaderUtils::AddPass(
+                    GraphBuilder,
+                    RDG_EVENT_NAME(
+                        "GaussianSplat_Precompute_Chunk%u_Offset%u",
+                        ChunkIndex,
+                        DispatchOffset),
+                    PrecomputeContext.PrecomputeShader,
+                    Parameters,
+                    FIntVector(static_cast<int32>(GroupCount), 1, 1));
+
+                DispatchOffset += GroupCount * PrecomputeGroupSize;
+            }
+        }
+
+        FGaussianBuildChunkIndirectArgsCS::FParameters* IndirectArgsParameters =
+            GraphBuilder.AllocParameters<
+                FGaussianBuildChunkIndirectArgsCS::FParameters>();
+        IndirectArgsParameters->VisibleCountBuffer =
+            PrecomputeContext.VisibleCountSRV;
+        IndirectArgsParameters->DrawSplatOffset = ChunkVisibleOffset;
+        IndirectArgsParameters->DrawSplatCapacity = ChunkSplatCount;
+        IndirectArgsParameters->OutDrawIndirectArgs =
+            PrecomputeContext.ChunkIndirectArgsUAV;
+        FComputeShaderUtils::AddPass(
+            GraphBuilder,
+            RDG_EVENT_NAME("GaussianSplat_ChunkIndirectArgs_%u", ChunkIndex),
+            PrecomputeContext.ChunkIndirectArgsShader,
+            IndirectArgsParameters,
+            FIntVector(1, 1, 1));
+
+        FGaussianSplatPassParameters* ChunkPassParameters =
+            GraphBuilder.AllocParameters<FGaussianSplatPassParameters>();
+        *ChunkPassParameters = *PrecomputeContext.BasePassParameters;
+        ChunkPassParameters->VS.PrecomputeVisibleOffset = ChunkVisibleOffset;
+        ChunkPassParameters->DrawIndirectArgsBuffer =
+            PrecomputeContext.ChunkIndirectArgsBuffer;
+
+        if (PrecomputeContext.bUseStochasticSplat && ChunkIndex > 0u)
+        {
+            if (PrecomputeContext.StochasticMotionTexture)
+            {
+                ChunkPassParameters->RenderTargets[1] = FRenderTargetBinding(
+                    PrecomputeContext.StochasticMotionTexture,
+                    ERenderTargetLoadAction::ELoad);
+            }
+            ChunkPassParameters->RenderTargets.DepthStencil = FDepthStencilBinding(
+                PrecomputeContext.StochasticDepthTexture,
+                ERenderTargetLoadAction::ELoad,
+                ERenderTargetLoadAction::ENoAction,
+                FExclusiveDepthStencil::DepthWrite_StencilNop);
+        }
+
+        AddGaussianSplatRasterPass(
+            GraphBuilder,
+            RasterContext,
+            PassName,
+            ChunkPassParameters,
+            static_cast<int32>(ChunkIndex));
+    }
 }
 
 }
@@ -455,6 +773,8 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     const int32 RasterMode = GaussianSplatCVars::GetRasterModeOnRenderThread();
     const int32 SortMethod = GaussianSplatCVars::GetSortMethodOnRenderThread();
     const bool bUseStochasticSplat = SortMethod == 2;
+    const int32 PrecomputeMode = GaussianSplatCVars::GetPrecomputeModeOnRenderThread();
+    const bool bUsePrecomputedSplats = PrecomputeMode > 0;
     if (!bUseStochasticSplat && !StochasticTemporalHistories.IsEmpty())
     {
         StochasticTemporalHistories.Empty();
@@ -468,6 +788,8 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     FGaussianSplatVS::FPermutationDomain VsPerm;
     FGaussianSplatMS::FPermutationDomain MsPerm;
     FGaussianSplatPS::FPermutationDomain PsPerm;
+    TShaderMapRef<FGaussianSplatPrecomputeCS> PrecomputeShader(ShaderMap);
+    TShaderMapRef<FGaussianBuildChunkIndirectArgsCS> ChunkIndirectArgsShader(ShaderMap);
     TShaderMapRef<FGaussianSplatVS> VertexShader(ShaderMap, FGaussianSplatVS::FPermutationDomain{});
     TShaderRef<FGaussianSplatMS> MeshShader;
     TShaderMapRef<FGaussianSplatPS> PixelShader(ShaderMap, FGaussianSplatPS::FPermutationDomain{});
@@ -480,6 +802,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         MsPerm.Set<FGaussianSplatRasterModeDim>(RasterMode);
         PsPerm.Set<FGaussianSplatRasterModeDim>(RasterMode);
         VsPerm.Set<FGaussianSplatStochasticDim>(bUseStochasticSplat);
+        VsPerm.Set<FGaussianSplatPrecomputedDim>(bUsePrecomputedSplats);
         MsPerm.Set<FGaussianSplatStochasticDim>(bUseStochasticSplat);
         PsPerm.Set<FGaussianSplatStochasticDim>(bUseStochasticSplat);
 
@@ -494,12 +817,15 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     }
     if (!VertexShader.IsValid() || !PixelShader.IsValid()
         || !CompositeVertexShader.IsValid() || !CompositePixelShader.IsValid()
+        || (bUsePrecomputedSplats && !PrecomputeShader.IsValid())
+        || (bUsePrecomputedSplats && !ChunkIndirectArgsShader.IsValid())
         || (bUseStochasticSplat && !TemporalPixelShader.IsValid()))
     {
         return;
     }
     const int32 GeometryMode = GaussianSplatCVars::GetGeometryModeOnRenderThread();
-    const bool bUseMeshShader = GeometryMode == 1
+    const bool bUseMeshShader = !bUsePrecomputedSplats
+        && GeometryMode == 1
         && GRHISupportsMeshShadersTier0
         && MeshShader.IsValid();
 
@@ -729,6 +1055,12 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     FRDGTextureRef GaussianAccumTexture = nullptr;
     const bool bRenderToAccumTexture = bCompositeToUELinear || bUseStochasticSplat;
     FRDGBufferRef DrawIndirectArgsBuffer = nullptr;
+    FRDGBufferSRVRef PrecomputedSplatSRV = nullptr;
+    FRDGBufferUAVRef PrecomputedSplatUAV = nullptr;
+    FRDGBufferRef PrecomputeChunkIndirectArgsBuffer = nullptr;
+    FRDGBufferUAVRef PrecomputeChunkIndirectArgsUAV = nullptr;
+    uint32 PrecomputeChunkCapacity = 0u;
+    const uint32 PrecomputeRecordFloat4s = bUseStochasticSplat ? 5u : 4u;
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_UploadDynamicBuffers_CPU);
         // 6.1 Upload the per-frame per-object descriptor buffer.
@@ -843,6 +1175,41 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         }
     }
 
+    // 6.5 Allocate a reusable projection chunk. The compute and raster passes are
+    // interleaved below so this buffer never scales with the full point cloud.
+    // Setting PrecomputeChunkSplats to 0 restores the original monolithic allocation.
+    if (bUsePrecomputedSplats)
+    {
+        const int32 RequestedChunkSplats =
+            GaussianSplatCVars::GetPrecomputeChunkSplatsOnRenderThread();
+        PrecomputeChunkCapacity = RequestedChunkSplats == 0
+            ? static_cast<uint32>(TotalSplats)
+            : FMath::Min(
+                static_cast<uint32>(TotalSplats),
+                static_cast<uint32>(RequestedChunkSplats));
+        const uint32 PrecomputedFloat4Count = FMath::Max<uint32>(
+            PrecomputeRecordFloat4s,
+            PrecomputeChunkCapacity * PrecomputeRecordFloat4s);
+        FRDGBufferDesc PrecomputedDesc = FRDGBufferDesc::CreateStructuredDesc(
+            sizeof(FVector4f),
+            PrecomputedFloat4Count);
+        FRDGBufferRef PrecomputedSplatBuffer = GraphBuilder.CreateBuffer(
+            PrecomputedDesc,
+            TEXT("GS_PrecomputedSplatChunk"));
+        PrecomputedSplatSRV = GraphBuilder.CreateSRV(PrecomputedSplatBuffer);
+        PrecomputedSplatUAV = GraphBuilder.CreateUAV(PrecomputedSplatBuffer);
+
+        FRDGBufferDesc ChunkIndirectDesc =
+            FRDGBufferDesc::CreateIndirectDesc<FRHIDrawIndirectParameters>(2);
+        ChunkIndirectDesc.Usage |=
+            EBufferUsageFlags::UnorderedAccess | EBufferUsageFlags::ShaderResource;
+        PrecomputeChunkIndirectArgsBuffer = GraphBuilder.CreateBuffer(
+            ChunkIndirectDesc,
+            TEXT("GS_PrecomputeChunkDrawIndirectArgs"));
+        PrecomputeChunkIndirectArgsUAV = GraphBuilder.CreateUAV(
+            FRDGBufferUAVDesc(PrecomputeChunkIndirectArgsBuffer, PF_R32_UINT));
+    }
+
     FRDGTextureRef GaussianStochasticMotionTexture = nullptr;
     if (bUseStochasticReprojection)
     {
@@ -865,6 +1232,13 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         GaussianStochasticDepthTexture = GraphBuilder.CreateTexture(StochasticDepthDesc, TEXT("GS_StochasticDepth"));
     }
     if (!SortedIndexSRV || !VisibleCountSRV || !DrawIndirectArgsBuffer) return;
+    if (bUsePrecomputedSplats
+        && (!PrecomputedSplatSRV || !PrecomputedSplatUAV
+            || !PrecomputeChunkIndirectArgsBuffer || !PrecomputeChunkIndirectArgsUAV
+            || PrecomputeChunkCapacity == 0u))
+    {
+        return;
+    }
 
 
     const FViewInfo* ViewInfo = InView.bIsViewInfo ? &static_cast<const FViewInfo&>(InView) : nullptr;
@@ -878,7 +1252,9 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_SetupAccumulatePass_CPU);
         PassParams->RenderTargets[0] = FRenderTargetBinding(
             bRenderToAccumTexture ? GaussianAccumTexture : SceneColorTexture,
-            bRenderToAccumTexture ? ERenderTargetLoadAction::EClear : ERenderTargetLoadAction::ELoad);
+            bRenderToAccumTexture && !bUsePrecomputedSplats
+                ? ERenderTargetLoadAction::EClear
+                : ERenderTargetLoadAction::ELoad);
         if (GaussianStochasticMotionTexture)
         {
             PassParams->RenderTargets[1] = FRenderTargetBinding(
@@ -916,6 +1292,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         PassParams->VS.PerObjectBuffer        = PerObjSRV;
         PassParams->VS.SortedVisibleIndexBuffer = SortedIndexSRV;
         PassParams->VS.VisibleCountBuffer = VisibleCountSRV;
+        PassParams->VS.PrecomputedSplatBuffer = PrecomputedSplatSRV;
         PassParams->DrawIndirectArgsBuffer = DrawIndirectArgsBuffer;
 
         PassParams->VS.WorldToView      = WorldToView;
@@ -927,6 +1304,8 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         PassParams->VS.ViewportSize     = FVector2f(VW, VH);
         PassParams->VS.TotalSplatCount  = TotalSplats;
         PassParams->VS.ObjectCount      = NumObjects;
+        PassParams->VS.PrecomputeVisibleOffset = 0u;
+        PassParams->VS.PrecomputeRecordFloat4s = PrecomputeRecordFloat4s;
         PassParams->VS.EnableAntialiasing = bEnableAntialiasing;
         PassParams->VS.EnableOpacityAwareBounds = bEnableOpacityAwareBounds;
         PassParams->VS.PreExposure      = CompositePreExposure;
@@ -950,90 +1329,72 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         }
     }
 
-    const TCHAR* GeometryBackendName = bUseMeshShader ? TEXT("MS") : TEXT("VS");
-    auto AddMainSplatPass = [&](const TCHAR* PassName)
-    {
-        GraphBuilder.AddPass(
-            RDG_EVENT_NAME("%s_%s", PassName, GeometryBackendName),
-            PassParams,
-            ERDGPassFlags::Raster,
-            [VertexShader, MeshShader, PixelShader, PassParams, VMinX, VMinY, VMaxX, VMaxY, bCompositeToUELinear, bUseManualSceneDepthTest, bUseMeshShader, bUseStochasticSplat, bHasSceneDepth = (SceneDepthTexture != nullptr)]
-            (FRHICommandList& RHICmdList)
-            {
-                FGraphicsPipelineStateInitializer PSOInit;
-                RHICmdList.ApplyCachedRenderTargets(PSOInit);
+    FGaussianSplatRasterPassContext RasterPassContext;
+    RasterPassContext.VertexShader = VertexShader;
+    RasterPassContext.MeshShader = MeshShader;
+    RasterPassContext.PixelShader = PixelShader;
+    RasterPassContext.ViewMinX = VMinX;
+    RasterPassContext.ViewMinY = VMinY;
+    RasterPassContext.ViewMaxX = VMaxX;
+    RasterPassContext.ViewMaxY = VMaxY;
+    RasterPassContext.bCompositeToUELinear = bCompositeToUELinear;
+    RasterPassContext.bUseManualSceneDepthTest = bUseManualSceneDepthTest;
+    RasterPassContext.bUseMeshShader = bUseMeshShader;
+    RasterPassContext.bUseStochasticSplat = bUseStochasticSplat;
+    RasterPassContext.bHasSceneDepth = SceneDepthTexture != nullptr;
 
-                // Only depth-test when a matching scene-depth target is bound. In the
-                // post-tonemap path with screen percentage < 100%, SceneColor may already
-                // be upscaled while scene depth is still primary-resolution, which clips
-                // rasterization to the smaller overlap region.
-                PSOInit.DepthStencilState = bUseStochasticSplat
-                    ? TStaticDepthStencilState<true, CF_DepthNearOrEqual>::GetRHI()
-                    : (bHasSceneDepth && !bUseManualSceneDepthTest)
-                    ? TStaticDepthStencilState<false, CF_DepthNearOrEqual>::GetRHI()
-                    : TStaticDepthStencilState<false, CF_Always>::GetRHI();
-                if (bCompositeToUELinear || bUseStochasticSplat)
-                {
-                    PSOInit.BlendState = TStaticBlendState<
-                        CW_RGBA,
-                        BO_Add, BF_One, BF_InverseSourceAlpha,
-                        BO_Add, BF_One,         BF_InverseSourceAlpha>::GetRHI();
-                }
-                else
-                {
-                    // After tonemap we can blend the splat result directly into SceneColor,
-                    // so RGB uses premultiplied alpha-over while SceneColor alpha is left untouched.
-                    PSOInit.BlendState = TStaticBlendState<
-                        CW_RGB,
-                        BO_Add, BF_One, BF_InverseSourceAlpha,
-                        BO_Add, BF_One,         BF_InverseSourceAlpha>::GetRHI();
-                }
-                PSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
-
-                if (bUseMeshShader)
-                {
-                    PSOInit.BoundShaderState.SetMeshShader(MeshShader.GetMeshShader());
-                }
-                else
-                {
-                    PSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
-                    PSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
-                }
-                PSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
-                PSOInit.PrimitiveType = PT_TriangleList;
-
-                SetGraphicsPipelineState(RHICmdList, PSOInit, 0);
-
-                RHICmdList.SetViewport(VMinX, VMinY, 0.0f, VMaxX, VMaxY, 1.0f);
-                if (bUseMeshShader)
-                {
-                    SetShaderParameters(RHICmdList, MeshShader, MeshShader.GetMeshShader(), PassParams->VS);
-                }
-                else
-                {
-                    SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), PassParams->VS);
-                }
-                SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PassParams->PS);
-                if (bUseMeshShader)
-                {
-                    RHICmdList.DispatchIndirectMeshShader(
-                        PassParams->DrawIndirectArgsBuffer->GetIndirectRHICallBuffer(),
-                        sizeof(FRHIDrawIndirectParameters));
-                }
-                else
-                {
-                    RHICmdList.DrawPrimitiveIndirect(PassParams->DrawIndirectArgsBuffer->GetIndirectRHICallBuffer(), 0);
-                }
-            }
-        );
-    };
+    FGaussianSplatPrecomputePassContext PrecomputePassContext;
+    PrecomputePassContext.PrecomputeShader = PrecomputeShader;
+    PrecomputePassContext.ChunkIndirectArgsShader = ChunkIndirectArgsShader;
+    PrecomputePassContext.BasePassParameters = PassParams;
+    PrecomputePassContext.PackedPositionSRV = PackedPosSRV;
+    PrecomputePassContext.PackedColorSRV = PackedColorSRV;
+    PrecomputePassContext.PackedRotationSRV = PackedRotationSRV;
+    PrecomputePassContext.PackedScaleSRV = PackedScaleSRV;
+    PrecomputePassContext.PackedSHDataSRV = PackedSHDataSRV;
+    PrecomputePassContext.SHCodebookSRV = SHCodebookSRV;
+    PrecomputePassContext.ChunkPositionMinSRV = ChunkPositionMinSRV;
+    PrecomputePassContext.ChunkPositionMaxSRV = ChunkPositionMaxSRV;
+    PrecomputePassContext.ObjectIndexSRV = ObjectIndexSRV;
+    PrecomputePassContext.PerObjectSRV = PerObjSRV;
+    PrecomputePassContext.SortedIndexSRV = SortedIndexSRV;
+    PrecomputePassContext.VisibleCountSRV = VisibleCountSRV;
+    PrecomputePassContext.PrecomputedSplatUAV = PrecomputedSplatUAV;
+    PrecomputePassContext.ChunkIndirectArgsBuffer =
+        PrecomputeChunkIndirectArgsBuffer;
+    PrecomputePassContext.ChunkIndirectArgsUAV =
+        PrecomputeChunkIndirectArgsUAV;
+    PrecomputePassContext.StochasticMotionTexture =
+        GaussianStochasticMotionTexture;
+    PrecomputePassContext.StochasticDepthTexture =
+        GaussianStochasticDepthTexture;
+    PrecomputePassContext.WorldToView = WorldToView;
+    PrecomputePassContext.ViewToClip = ViewToClip;
+    PrecomputePassContext.PreviousWorldToClip = PreviousWorldToClip;
+    PrecomputePassContext.CameraPosition = CameraPos;
+    PrecomputePassContext.FocalLength = FVector2f(FX, FY);
+    PrecomputePassContext.ViewportMin = FVector2f(VMinX, VMinY);
+    PrecomputePassContext.ViewportSize = FVector2f(VW, VH);
+    PrecomputePassContext.TotalSplatCount = TotalSplats;
+    PrecomputePassContext.ObjectCount = NumObjects;
+    PrecomputePassContext.ChunkCapacity = PrecomputeChunkCapacity;
+    PrecomputePassContext.RecordFloat4s = PrecomputeRecordFloat4s;
+    PrecomputePassContext.EnableAntialiasing = bEnableAntialiasing;
+    PrecomputePassContext.EnableOpacityAwareBounds =
+        bEnableOpacityAwareBounds;
+    PrecomputePassContext.bUsePrecomputedSplats = bUsePrecomputedSplats;
+    PrecomputePassContext.bUseStochasticSplat = bUseStochasticSplat;
 
     if (bRenderToAccumTexture)
     {
         {
             RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussianSplatAccumulate, "GaussianSplat_Accumulate");
             RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplatAccumulate);
-            AddMainSplatPass(TEXT("GaussianSplat_Accumulate"));
+            AddGaussianSplatRasterPasses(
+                GraphBuilder,
+                RasterPassContext,
+                PrecomputePassContext,
+                TEXT("GaussianSplat_Accumulate"));
         }
 
         // 8. Composite the fully accumulated 3DGS image into UE SceneColor.
@@ -1187,7 +1548,11 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         {
             RDG_EVENT_SCOPE_STAT(GraphBuilder, GaussianSplatDirect, "GaussianSplat_DirectAfterTonemap");
             RDG_GPU_STAT_SCOPE(GraphBuilder, GaussianSplatDirect);
-            AddMainSplatPass(TEXT("GaussianSplat_DirectAfterTonemap"));
+            AddGaussianSplatRasterPasses(
+                GraphBuilder,
+                RasterPassContext,
+                PrecomputePassContext,
+                TEXT("GaussianSplat_DirectAfterTonemap"));
         }
     }
 }

@@ -23,6 +23,18 @@
 #define RASTER_MODE 1
 #endif
 
+#ifndef PRECOMPUTED_SPLAT
+#define PRECOMPUTED_SPLAT 0
+#endif
+
+#ifndef INSTANCED_QUAD
+#define INSTANCED_QUAD 0
+#endif
+
+#ifndef PRECOMPUTE_GROUP_SIZE
+#define PRECOMPUTE_GROUP_SIZE 64
+#endif
+
 // ============================================================
 // Per-Object GPU Descriptor
 // Must match FGaussianSplatObjectGPUDesc in GaussianSplatShaders.h
@@ -104,6 +116,8 @@ Buffer<uint>             GlobalObjectIndexBuffer; // N_total uints: global splat
 // Draw-order buffer over the global splat list.
 Buffer<uint> SortedVisibleIndexBuffer;
 Buffer<uint> VisibleCountBuffer;
+StructuredBuffer<float4> PrecomputedSplatBuffer;
+RWStructuredBuffer<float4> OutPrecomputedSplatBuffer;
 
 
 // Camera / viewport (shared for all objects in this pass)
@@ -126,6 +140,10 @@ int       ObjectCount;
 uint      EnableAntialiasing;
 uint      EnableOpacityAwareBounds;
 float     PreExposure;      // View.PreExposure: multiplier to match SceneColor HDR range
+uint      PrecomputeVisibleOffset;
+uint      PrecomputeDispatchOffset;
+uint      PrecomputeChunkSplatCount;
+uint      PrecomputeRecordFloat4s;
 static const uint GS_CHUNK_SIZE = 256u;
 // ============================================================
 // Object descriptor loader
@@ -444,12 +462,187 @@ static const float2 QUAD_CORNERS[6] = {
     float2(-1,-1), float2(1,1), float2(-1,1)
 };
 
+void StoreInvalidPrecomputedSplat(uint localVisibleIndex, uint globalIdx)
+{
+    const uint recordBase = localVisibleIndex * PrecomputeRecordFloat4s;
+    OutPrecomputedSplatBuffer[recordBase + 0u] = float4(0.0f, 0.0f, 2.0f, 0.0f);
+    OutPrecomputedSplatBuffer[recordBase + 1u] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    OutPrecomputedSplatBuffer[recordBase + 2u] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    OutPrecomputedSplatBuffer[recordBase + 3u] = float4(0.0f, 0.0f, 0.0f, asfloat(globalIdx));
+    if (PrecomputeRecordFloat4s > 4u)
+    {
+        OutPrecomputedSplatBuffer[recordBase + 4u] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+}
+
+// Compute the expensive per-splat projection once after sorting. The lightweight
+// VS permutations below only expand the cached screen-space ellipse corners.
+[numthreads(PRECOMPUTE_GROUP_SIZE, 1, 1)]
+void GaussianSplatPrecomputeCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    const uint localVisibleIndex = PrecomputeDispatchOffset + ThreadId.x;
+    if (localVisibleIndex >= PrecomputeChunkSplatCount)
+    {
+        return;
+    }
+
+    const uint visibleIndex = PrecomputeVisibleOffset + localVisibleIndex;
+    const uint visibleCount = VisibleCountBuffer[0];
+    if (visibleIndex >= visibleCount)
+    {
+        return;
+    }
+
+    const uint globalIdx = SortedVisibleIndexBuffer[visibleIndex];
+    StoreInvalidPrecomputedSplat(localVisibleIndex, globalIdx);
+    if (globalIdx >= (uint)TotalSplatCount)
+    {
+        return;
+    }
+
+    const uint objectIndex = GlobalObjectIndexBuffer[globalIdx];
+    if (objectIndex >= (uint)ObjectCount)
+    {
+        return;
+    }
+
+    FObjectDesc obj = LoadObjectDesc(objectIndex);
+    const uint splatIdx = globalIdx - obj.SplatOffset;
+    const float3 splatPos = DecodeGlobalSplatPosition(obj, globalIdx, splatIdx);
+    float4 splatColor = DecodePackedColor(obj, GlobalPackedColorBuffer[globalIdx]);
+    if (splatColor.a < obj.AlphaCullThreshold)
+    {
+        return;
+    }
+
+    const float4x4 MV = mul(obj.LocalToWorld, WorldToView);
+    const float4 worldCenter = mul(float4(splatPos, 1.0f), obj.LocalToWorld);
+    const float4 vCenter = mul(worldCenter, WorldToView);
+    if (vCenter.z < 0.01f)
+    {
+        return;
+    }
+
+    float4 clipCenter = mul(vCenter, ViewToClip);
+    const float clipW = clipCenter.w;
+    if (clipW <= 0.0f)
+    {
+        return;
+    }
+    clipCenter.z = clamp(clipCenter.z, 0.0f, clipW);
+
+    const int maxSHDeg = (int)obj.MaxSHDegree;
+    if (maxSHDeg > 0)
+    {
+        const float3 localCamPos = mul(float4(CameraPosition, 1.0f), obj.WorldToLocal).xyz;
+        const float3 viewDirUE = normalize(splatPos - localCamPos);
+        const float3 viewDir3DGS = float3(viewDirUE.y, -viewDirUE.z, viewDirUE.x);
+        float3 sh1[3], sh2[5], sh3[7];
+        FetchSHGlobal(globalIdx, obj, maxSHDeg, sh1, sh2, sh3);
+        splatColor.rgb += EvaluateSH(viewDir3DGS, maxSHDeg, sh1, sh2, sh3);
+    }
+    splatColor.rgb = max(splatColor.rgb, float3(0.0f, 0.0f, 0.0f));
+
+    const float4 rotationQuat = DecodePackedQuaternion(GlobalPackedRotationBuffer[globalIdx]);
+    const float3 scale = DecodeGlobalSplatScale(obj, globalIdx, splatIdx);
+    const float3x3 cov3D = BuildCovariance3D(rotationQuat, scale);
+    float3 cov2D = ProjectCovariance2D(cov3D, vCenter, FocalLength, ViewportSize, MV);
+
+    const float detBeforeFilter = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
+    cov2D.x += 0.1f;
+    cov2D.z += 0.1f;
+    const float detAfterFilter = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
+    if (EnableAntialiasing != 0u && detBeforeFilter > 0.0f && detAfterFilter > 0.0f)
+    {
+        splatColor.a *= sqrt(max(0.000025f, detBeforeFilter / detAfterFilter));
+    }
+
+    float3 conic;
+    if (!ComputeConicFromCovariance(cov2D, conic))
+    {
+        return;
+    }
+
+    float gaussianExtent = SQRT8;
+    float opacity = splatColor.a;
+    if (EnableOpacityAwareBounds != 0u)
+    {
+        const float alphaThreshold = 1.0f / 255.0f;
+        gaussianExtent = min(
+            SQRT8,
+            sqrt(max(0.0f, 2.0f * log(max(opacity, alphaThreshold) / alphaThreshold))));
+    }
+
+    float2 basis1;
+    float2 basis2;
+    if (!ComputeProjectedExtentBasis(cov2D, gaussianExtent, obj.SplatScale, opacity, basis1, basis2))
+    {
+        return;
+    }
+    splatColor.a = opacity;
+
+    const float3 ndcCenter = clipCenter.xyz / clipW;
+    const uint recordBase = localVisibleIndex * PrecomputeRecordFloat4s;
+    OutPrecomputedSplatBuffer[recordBase + 0u] = float4(ndcCenter, gaussianExtent);
+    OutPrecomputedSplatBuffer[recordBase + 1u] = float4(basis1, basis2);
+    OutPrecomputedSplatBuffer[recordBase + 2u] = splatColor;
+    OutPrecomputedSplatBuffer[recordBase + 3u] = float4(conic, asfloat(globalIdx));
+    if (PrecomputeRecordFloat4s > 4u)
+    {
+        float3 reprojection = float3(0.0f, 0.0f, 0.0f);
+        const float4 previousClipCenter = mul(worldCenter, PreviousWorldToClip);
+        if (previousClipCenter.w > 1e-6f)
+        {
+            const float2 previousNdc = previousClipCenter.xy / previousClipCenter.w;
+            reprojection.xy = 0.5f * float2(
+                previousNdc.x - ndcCenter.x,
+                ndcCenter.y - previousNdc.y);
+            reprojection.z = 1.0f;
+        }
+        OutPrecomputedSplatBuffer[recordBase + 4u] = float4(reprojection, 0.0f);
+    }
+}
+
 // ============================================================
 // VERTEX SHADER
 // ============================================================
 FVSOutput GaussianSplatVS(uint VertexID : SV_VertexID)
 {
     FVSOutput Out = MakeInvalidOutput();
+
+#if PRECOMPUTED_SPLAT
+    const uint localVisibleIndex = VertexID / 6u;
+    const uint visibleIndex = PrecomputeVisibleOffset + localVisibleIndex;
+    const uint cornerIndex = VertexID % 6u;
+    if (visibleIndex >= VisibleCountBuffer[0])
+    {
+        return Out;
+    }
+
+    const uint recordBase = localVisibleIndex * PrecomputeRecordFloat4s;
+    const float4 centerAndExtent = PrecomputedSplatBuffer[recordBase + 0u];
+    const float4 basis = PrecomputedSplatBuffer[recordBase + 1u];
+    const float4 splatColor = PrecomputedSplatBuffer[recordBase + 2u];
+    const float4 conicAndID = PrecomputedSplatBuffer[recordBase + 3u];
+    const float2 corner = QUAD_CORNERS[cornerIndex];
+    const float2 pixelOffset = corner.x * basis.xy + corner.y * basis.zw;
+    const float2 ndcOffset = pixelOffset * float2(2.0f, -2.0f) / ViewportSize;
+
+    Out.Position = float4(centerAndExtent.xy + ndcOffset, centerAndExtent.z, 1.0f);
+    Out.SplatColor = splatColor;
+#if RASTER_MODE == 0
+    Out.FragPos = corner * centerAndExtent.w;
+#else
+    Out.ScreenCenter.x = ViewportMin.x + (centerAndExtent.x * 0.5f + 0.5f) * ViewportSize.x;
+    Out.ScreenCenter.y = ViewportMin.y + (0.5f - centerAndExtent.y * 0.5f) * ViewportSize.y;
+    Out.Conic = conicAndID.xyz;
+#endif
+#if STOCHASTIC_SPLAT
+    Out.SplatID = asuint(conicAndID.w);
+    Out.Reprojection = PrecomputedSplatBuffer[recordBase + 4u].xyz;
+#endif
+    return Out;
+#else
 
     // ---- Decode sorted global splat index ----
     uint globalIdx = SortedVisibleIndexBuffer[VertexID / 6];
@@ -612,6 +805,7 @@ FVSOutput GaussianSplatVS(uint VertexID : SV_VertexID)
 #endif
 
     return Out;
+#endif
 }
 
 #if MESHSHADER

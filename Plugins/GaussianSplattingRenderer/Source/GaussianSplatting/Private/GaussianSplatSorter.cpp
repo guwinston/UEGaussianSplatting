@@ -659,6 +659,8 @@ bool FGaussianSplatSorter::BuildGPUSortedDrawBuffers(
         TShaderMapRef<FGaussianBuildIndirectArgsCS> ComputeShader(ShaderMap);
         FGaussianBuildIndirectArgsCS::FParameters Parameters;
         Parameters.VisibleCountBuffer = VisibleCountSRV;
+        Parameters.DrawSplatOffset = 0u;
+        Parameters.DrawSplatCapacity = MAX_uint32;
         Parameters.OutDrawIndirectArgs = DrawIndirectArgsUAV;
 
         RHICmdList.Transition(FRHITransitionInfo(DrawIndirectArgsUAV, ERHIAccess::Unknown, ERHIAccess::UAVCompute));

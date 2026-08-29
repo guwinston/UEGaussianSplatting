@@ -153,6 +153,8 @@ Useful runtime controls:
 
 ```text
 r.GaussianSplat.GeometryMode
+r.GaussianSplat.PrecomputeMode
+r.GaussianSplat.PrecomputeChunkSplats
 r.GaussianSplat.SortMethod
 r.GaussianSplat.DeviceRadixPasses
 r.GaussianSplat.DeviceRadixWriteFinalKeys
@@ -172,6 +174,10 @@ r.GaussianSplat.SplatFrustumSlack
 
 - `r.GaussianSplat.GeometryMode`
   `0` uses VS + PS; `1` requests Mesh Shader + PS and automatically falls back to VS when mesh shaders are unavailable.
+- `r.GaussianSplat.PrecomputeMode`
+  Selects the projection path. `0` keeps the legacy six-vertex path and repeats projection work in the VS; `1` precomputes one screen-space record per visible splat and keeps the six-vertex draw. Stochastic no-sort rendering is supported: its precomputed record adds the previous-frame reprojection vector required by temporal accumulation. The default remains `0` for an unchanged baseline.
+- `r.GaussianSplat.PrecomputeChunkSplats`
+  Caps the reusable preprojection buffer and interleaves compute/draw chunks without changing draw order. The default `1048576` uses 64 MiB normally and 80 MiB with stochastic reprojection; values are clamped to 65536..4194304. Set `0` to restore a monolithic full-cloud allocation for memory/performance A/B tests.
 - `r.GaussianSplat.SortMethod`
   `0` uses UE `SortGPUBuffers`, `1` uses DeviceRadix over the compacted visible count (default), and `2` enables experimental no-sort stochastic rendering.
 - `r.GaussianSplat.DeviceRadixPasses`
@@ -200,6 +206,20 @@ r.GaussianSplat.SplatFrustumSlack
   `0` disables culling, `1` enables object-level culling only, and `2` enables object-level plus per-splat XY frustum culling.
 - `r.GaussianSplat.SplatFrustumSlack`
   Adjusts the slack factor used by per-splat frustum culling to reduce accidental clipping near the viewport edges.
+
+For an in-process A/B comparison, keep the camera, resolution, sort settings, and
+`r.GaussianSplat.ForceSortEveryFrame` value fixed, then switch only the precompute mode:
+
+```text
+r.GaussianSplat.PrecomputeMode 0
+r.GaussianSplat.PrecomputeMode 1
+r.GaussianSplat.PrecomputeChunkSplats 1048576
+stat gpu
+```
+
+The GPU profiler exposes the extra compute stage as `Gaussian Splat Precompute`.
+Compare total `Gaussian Splat` GPU time rather than raster time alone because mode
+`1` deliberately moves projection work out of the vertex shader.
 
 ## Selection And Collision Proxy
 

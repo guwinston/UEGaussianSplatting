@@ -142,6 +142,22 @@ static TAutoConsoleVariable<int32> CVarGaussianSplatGeometryMode(
     TEXT(" 1 = mesh shader + PS (falls back to VS when unsupported)"),
     ECVF_RenderThreadSafe);
 
+static TAutoConsoleVariable<int32> CVarGaussianSplatPrecomputeMode(
+    TEXT("r.GaussianSplat.PrecomputeMode"),
+    0,
+    TEXT("Select the mobile-friendly Gaussian projection path.\n")
+    TEXT(" 0 = legacy VS projection, six vertices per splat\n")
+    TEXT(" 1 = compute preprojection, lightweight six-vertex VS"),
+    ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarGaussianSplatPrecomputeChunkSplats(
+    TEXT("r.GaussianSplat.PrecomputeChunkSplats"),
+    1048576,
+    TEXT("Maximum splats held by the reusable preprojection buffer.\n")
+    TEXT(" 0 = legacy monolithic allocation (64 bytes/splat, 80 for stochastic)\n")
+    TEXT(" >0 = sorted chunk size, clamped to 65536..4194304 splats"),
+    ECVF_RenderThreadSafe);
+
 
 namespace GaussianSplatCVars
 {
@@ -178,6 +194,19 @@ namespace GaussianSplatCVars
     int32 GetGeometryModeOnRenderThread()
     {
         return FMath::Clamp(CVarGaussianSplatGeometryMode.GetValueOnRenderThread(), 0, 1);
+    }
+
+    int32 GetPrecomputeModeOnRenderThread()
+    {
+        return FMath::Clamp(CVarGaussianSplatPrecomputeMode.GetValueOnRenderThread(), 0, 1);
+    }
+
+    int32 GetPrecomputeChunkSplatsOnRenderThread()
+    {
+        const int32 RequestedChunkSplats = CVarGaussianSplatPrecomputeChunkSplats.GetValueOnRenderThread();
+        return RequestedChunkSplats <= 0
+            ? 0
+            : FMath::Clamp(RequestedChunkSplats, 65536, 4194304);
     }
 
 

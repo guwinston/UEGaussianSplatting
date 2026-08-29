@@ -35,6 +35,8 @@ float MaxFocalLengthPixels;
 // 1: compact key/value stream for DeviceRadix
 // 2: compact values only for stochastic no-sort rendering
 uint CompactVisibleOutput;
+uint DrawSplatOffset;
+uint DrawSplatCapacity;
 float4x4 WorldToView;
 float4x4 ViewToClip;
 
@@ -383,9 +385,11 @@ void BuildSortKeysCS(uint3 ThreadId : SV_DispatchThreadID)
 void BuildIndirectArgsCS(uint3 ThreadId : SV_DispatchThreadID)
 {
     uint visibleCount = VisibleCountBuffer[0];
+    uint firstSplat = min(visibleCount, DrawSplatOffset);
+    uint drawSplatCount = min(visibleCount - firstSplat, DrawSplatCapacity);
 
     // FRHIDrawIndirectParameters at byte offset 0.
-    OutDrawIndirectArgs[0] = visibleCount * 6u;
+    OutDrawIndirectArgs[0] = drawSplatCount * 6u;
     OutDrawIndirectArgs[1] = 1u;
     OutDrawIndirectArgs[2] = 0u;
     OutDrawIndirectArgs[3] = 0u;
@@ -394,7 +398,7 @@ void BuildIndirectArgsCS(uint3 ThreadId : SV_DispatchThreadID)
     // Spread large point clouds over X/Y because each dispatch dimension is limited.
     const uint splatsPerGroup = 32u;
     const uint maxGroupsX = 65535u;
-    uint meshGroupCount = (visibleCount + splatsPerGroup - 1u) / splatsPerGroup;
+    uint meshGroupCount = (drawSplatCount + splatsPerGroup - 1u) / splatsPerGroup;
     OutDrawIndirectArgs[4] = min(meshGroupCount, maxGroupsX);
     OutDrawIndirectArgs[5] = max(1u, (meshGroupCount + maxGroupsX - 1u) / maxGroupsX);
     OutDrawIndirectArgs[6] = 1u;
