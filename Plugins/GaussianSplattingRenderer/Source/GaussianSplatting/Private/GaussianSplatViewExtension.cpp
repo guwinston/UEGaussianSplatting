@@ -88,7 +88,6 @@ struct FGaussianSplatRasterPassContext
     bool bUseManualSceneDepthTest = false;
     bool bUseMeshShader = false;
     bool bUseStochasticSplat = false;
-    bool bUseTransmittanceStencil = false;
     bool bHasSceneDepth = false;
 };
 
@@ -111,7 +110,6 @@ static void AddGaussianSplatRasterPass(
     const bool bUseManualSceneDepthTest = Context.bUseManualSceneDepthTest;
     const bool bUseMeshShader = Context.bUseMeshShader;
     const bool bUseStochasticSplat = Context.bUseStochasticSplat;
-    const bool bUseTransmittanceStencil = Context.bUseTransmittanceStencil;
     const bool bHasSceneDepth = Context.bHasSceneDepth;
 
     GraphBuilder.AddPass(
@@ -121,33 +119,18 @@ static void AddGaussianSplatRasterPass(
         [VertexShader, MeshShader, PixelShader, PassParameters,
          ViewMinX, ViewMinY, ViewMaxX, ViewMaxY,
          bCompositeToUELinear, bUseManualSceneDepthTest,
-         bUseMeshShader, bUseStochasticSplat, bUseTransmittanceStencil, bHasSceneDepth]
+         bUseMeshShader, bUseStochasticSplat, bHasSceneDepth]
         (FRHICommandList& RHICmdList)
         {
             FGraphicsPipelineStateInitializer PSOInit;
             RHICmdList.ApplyCachedRenderTargets(PSOInit);
 
-            PSOInit.DepthStencilState = bUseTransmittanceStencil
-                ? TStaticDepthStencilState<
-                    false, CF_Always,
-                    true, CF_NotEqual, SO_Keep, SO_Keep, SO_Keep,
-                    true, CF_NotEqual, SO_Keep, SO_Keep, SO_Keep,
-                    0xFF, 0x00>::GetRHI()
-                : bUseStochasticSplat
+            PSOInit.DepthStencilState = bUseStochasticSplat
                 ? TStaticDepthStencilState<true, CF_DepthNearOrEqual>::GetRHI()
                 : (bHasSceneDepth && !bUseManualSceneDepthTest)
                 ? TStaticDepthStencilState<false, CF_DepthNearOrEqual>::GetRHI()
                 : TStaticDepthStencilState<false, CF_Always>::GetRHI();
-            if (bUseTransmittanceStencil)
-            {
-                // RGB accumulates front-to-back using destination alpha as the
-                // remaining transmittance. Destination alpha becomes T*(1-a).
-                PSOInit.BlendState = TStaticBlendState<
-                    CW_RGBA,
-                    BO_Add, BF_DestAlpha, BF_One,
-                    BO_Add, BF_Zero, BF_InverseSourceAlpha>::GetRHI();
-            }
-            else if (bCompositeToUELinear || bUseStochasticSplat)
+            if (bCompositeToUELinear || bUseStochasticSplat)
             {
                 PSOInit.BlendState = TStaticBlendState<
                     CW_RGBA,
@@ -176,8 +159,7 @@ static void AddGaussianSplatRasterPass(
             PSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
             PSOInit.PrimitiveType = PT_TriangleList;
 
-            SetGraphicsPipelineState(
-                RHICmdList, PSOInit, bUseTransmittanceStencil ? 1u : 0u);
+            SetGraphicsPipelineState(RHICmdList, PSOInit, 0);
             RHICmdList.SetViewport(
                 ViewMinX, ViewMinY, 0.0f, ViewMaxX, ViewMaxY, 1.0f);
 
@@ -208,70 +190,10 @@ static void AddGaussianSplatRasterPass(
         });
 }
 
-static void AddGaussianTransmittanceStencilPass(
-    FRDGBuilder& GraphBuilder,
-    TShaderRef<FGaussianSplatCompositeVS> VertexShader,
-    TShaderRef<FGaussianSplatTransmittanceStencilPS> PixelShader,
-    FRDGTextureRef AccumTexture,
-    FRDGTextureRef StencilTexture,
-    float Threshold,
-    float ViewMinX,
-    float ViewMinY,
-    float ViewMaxX,
-    float ViewMaxY,
-    int32 ChunkIndex)
-{
-    FGaussianSplatTransmittanceStencilPassParameters* PassParameters =
-        GraphBuilder.AllocParameters<FGaussianSplatTransmittanceStencilPassParameters>();
-    PassParameters->PS.GaussianAccumTexture = AccumTexture;
-    PassParameters->PS.TransmittanceThreshold = Threshold;
-    PassParameters->RenderTargets.DepthStencil = FDepthStencilBinding(
-        StencilTexture,
-        ERenderTargetLoadAction::ENoAction,
-        ERenderTargetLoadAction::ELoad,
-        FExclusiveDepthStencil::DepthNop_StencilWrite);
-
-    GraphBuilder.AddPass(
-        RDG_EVENT_NAME("GaussianSplat_TransmittanceStencil_Chunk%d", ChunkIndex),
-        PassParameters,
-        ERDGPassFlags::Raster,
-        [VertexShader, PixelShader, PassParameters,
-         ViewMinX, ViewMinY, ViewMaxX, ViewMaxY](FRHICommandList& RHICmdList)
-        {
-            FGraphicsPipelineStateInitializer PSOInit;
-            RHICmdList.ApplyCachedRenderTargets(PSOInit);
-            PSOInit.DepthStencilState = TStaticDepthStencilState<
-                false, CF_Always,
-                true, CF_Always, SO_Keep, SO_Keep, SO_Replace,
-                true, CF_Always, SO_Keep, SO_Keep, SO_Replace,
-                0x00, 0xFF>::GetRHI();
-            PSOInit.BlendState = TStaticBlendState<CW_NONE>::GetRHI();
-            PSOInit.RasterizerState =
-                TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
-            PSOInit.BoundShaderState.VertexDeclarationRHI =
-                GEmptyVertexDeclaration.VertexDeclarationRHI;
-            PSOInit.BoundShaderState.VertexShaderRHI =
-                VertexShader.GetVertexShader();
-            PSOInit.BoundShaderState.PixelShaderRHI =
-                PixelShader.GetPixelShader();
-            PSOInit.PrimitiveType = PT_TriangleList;
-
-            SetGraphicsPipelineState(RHICmdList, PSOInit, 1u);
-            RHICmdList.SetViewport(
-                ViewMinX, ViewMinY, 0.0f, ViewMaxX, ViewMaxY, 1.0f);
-            SetShaderParameters(
-                RHICmdList, PixelShader, PixelShader.GetPixelShader(),
-                PassParameters->PS);
-            RHICmdList.DrawPrimitive(0, 1, 1);
-        });
-}
-
 struct FGaussianSplatPrecomputePassContext
 {
     TShaderRef<FGaussianSplatPrecomputeCS> PrecomputeShader;
     TShaderRef<FGaussianBuildChunkIndirectArgsCS> ChunkIndirectArgsShader;
-    TShaderRef<FGaussianSplatCompositeVS> FullscreenVertexShader;
-    TShaderRef<FGaussianSplatTransmittanceStencilPS> TransmittanceStencilShader;
     FGaussianSplatPassParameters* BasePassParameters = nullptr;
 
     FRDGBufferSRVRef PackedPositionSRV = nullptr;
@@ -292,8 +214,6 @@ struct FGaussianSplatPrecomputePassContext
 
     FRDGTextureRef StochasticMotionTexture = nullptr;
     FRDGTextureRef StochasticDepthTexture = nullptr;
-    FRDGTextureRef AccumTexture = nullptr;
-    FRDGTextureRef TransmittanceStencilTexture = nullptr;
 
     FMatrix44f WorldToView;
     FMatrix44f ViewToClip;
@@ -309,11 +229,8 @@ struct FGaussianSplatPrecomputePassContext
     uint32 RecordFloat4s = 0u;
     uint32 EnableAntialiasing = 0u;
     uint32 EnableOpacityAwareBounds = 0u;
-    uint32 TransmittanceChunkCount = 1u;
-    float TransmittanceThreshold = 0.01f;
     bool bUsePrecomputedSplats = false;
     bool bUseStochasticSplat = false;
-    bool bUseTransmittanceStencil = false;
 };
 
 static void AddGaussianSplatRasterPasses(
@@ -322,8 +239,7 @@ static void AddGaussianSplatRasterPasses(
     const FGaussianSplatPrecomputePassContext& PrecomputeContext,
     const TCHAR* PassName)
 {
-    if (!PrecomputeContext.bUsePrecomputedSplats
-        && !PrecomputeContext.bUseTransmittanceStencil)
+    if (!PrecomputeContext.bUsePrecomputedSplats)
     {
         AddGaussianSplatRasterPass(
             GraphBuilder,
@@ -340,32 +256,17 @@ static void AddGaussianSplatRasterPasses(
         static_cast<uint32>(GRHIGlobals.MaxDispatchThreadGroupsPerDimension.X));
     const uint32 TotalSplatCount =
         static_cast<uint32>(PrecomputeContext.TotalSplatCount);
-    const uint32 RequestedTransmittanceChunks = FMath::Max(
-        1u, PrecomputeContext.TransmittanceChunkCount);
-    const uint32 TransmittanceChunkCapacity = FMath::Max(
-        1u,
-        FMath::DivideAndRoundUp(
-            TotalSplatCount, RequestedTransmittanceChunks));
-    const uint32 RasterChunkCapacity =
-        PrecomputeContext.bUsePrecomputedSplats
-        ? (PrecomputeContext.bUseTransmittanceStencil
-            ? FMath::Min(
-                PrecomputeContext.ChunkCapacity,
-                TransmittanceChunkCapacity)
-            : PrecomputeContext.ChunkCapacity)
-        : TransmittanceChunkCapacity;
     const uint32 ChunkCount =
-        FMath::DivideAndRoundUp(TotalSplatCount, RasterChunkCapacity);
+        FMath::DivideAndRoundUp(TotalSplatCount, PrecomputeContext.ChunkCapacity);
 
     for (uint32 ChunkIndex = 0u; ChunkIndex < ChunkCount; ++ChunkIndex)
     {
         const uint32 ChunkVisibleOffset =
-            ChunkIndex * RasterChunkCapacity;
+            ChunkIndex * PrecomputeContext.ChunkCapacity;
         const uint32 ChunkSplatCount = FMath::Min(
-            RasterChunkCapacity,
+            PrecomputeContext.ChunkCapacity,
             TotalSplatCount - ChunkVisibleOffset);
 
-        if (PrecomputeContext.bUsePrecomputedSplats)
         {
             RDG_EVENT_SCOPE_STAT(
                 GraphBuilder,
@@ -481,14 +382,6 @@ static void AddGaussianSplatRasterPasses(
                 ERenderTargetLoadAction::ENoAction,
                 FExclusiveDepthStencil::DepthWrite_StencilNop);
         }
-        else if (PrecomputeContext.bUseTransmittanceStencil)
-        {
-            ChunkPassParameters->RenderTargets.DepthStencil = FDepthStencilBinding(
-                PrecomputeContext.TransmittanceStencilTexture,
-                ERenderTargetLoadAction::ENoAction,
-                ERenderTargetLoadAction::ELoad,
-                FExclusiveDepthStencil::DepthNop_StencilRead);
-        }
 
         AddGaussianSplatRasterPass(
             GraphBuilder,
@@ -496,30 +389,6 @@ static void AddGaussianSplatRasterPasses(
             PassName,
             ChunkPassParameters,
             static_cast<int32>(ChunkIndex));
-
-        const uint32 PreviousStencilGroup =
-            (ChunkIndex * RequestedTransmittanceChunks) / ChunkCount;
-        const uint32 CompletedStencilGroup =
-            ((ChunkIndex + 1u) * RequestedTransmittanceChunks) / ChunkCount;
-        const bool bEndOfStencilGroup =
-            CompletedStencilGroup > PreviousStencilGroup;
-        if (PrecomputeContext.bUseTransmittanceStencil
-            && bEndOfStencilGroup
-            && ChunkIndex + 1u < ChunkCount)
-        {
-            AddGaussianTransmittanceStencilPass(
-                GraphBuilder,
-                PrecomputeContext.FullscreenVertexShader,
-                PrecomputeContext.TransmittanceStencilShader,
-                PrecomputeContext.AccumTexture,
-                PrecomputeContext.TransmittanceStencilTexture,
-                PrecomputeContext.TransmittanceThreshold,
-                RasterContext.ViewMinX,
-                RasterContext.ViewMinY,
-                RasterContext.ViewMaxX,
-                RasterContext.ViewMaxY,
-                static_cast<int32>(ChunkIndex));
-        }
     }
 }
 
@@ -904,13 +773,6 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     const int32 RasterMode = GaussianSplatCVars::GetRasterModeOnRenderThread();
     const int32 SortMethod = GaussianSplatCVars::GetSortMethodOnRenderThread();
     const bool bUseStochasticSplat = SortMethod == 2;
-    const bool bUseTransmittanceStencil =
-        GaussianSplatCVars::GetTransmittanceStencilOnAnyThread() != 0
-        && !bUseStochasticSplat;
-    const uint32 TransmittanceChunkCount = static_cast<uint32>(
-        GaussianSplatCVars::GetTransmittanceChunksOnRenderThread());
-    const float TransmittanceThreshold =
-        GaussianSplatCVars::GetTransmittanceThresholdOnRenderThread();
     const int32 PrecomputeMode = GaussianSplatCVars::GetPrecomputeModeOnRenderThread();
     const bool bUsePrecomputedSplats = PrecomputeMode > 0;
     if (!bUseStochasticSplat && !StochasticTemporalHistories.IsEmpty())
@@ -933,8 +795,6 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     TShaderMapRef<FGaussianSplatPS> PixelShader(ShaderMap, FGaussianSplatPS::FPermutationDomain{});
     TShaderMapRef<FGaussianSplatCompositeVS> CompositeVertexShader(ShaderMap);
     TShaderMapRef<FGaussianSplatCompositePS> CompositePixelShader(ShaderMap);
-    TShaderMapRef<FGaussianSplatTransmittanceStencilPS>
-        TransmittanceStencilPixelShader(ShaderMap);
     TShaderMapRef<FGaussianSplatTemporalPS> TemporalPixelShader(ShaderMap);
     {
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_SetupShaders_CPU);
@@ -954,23 +814,17 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         PixelShader = TShaderMapRef<FGaussianSplatPS>(ShaderMap, PsPerm);
         CompositeVertexShader = TShaderMapRef<FGaussianSplatCompositeVS>(ShaderMap);
         CompositePixelShader = TShaderMapRef<FGaussianSplatCompositePS>(ShaderMap);
-        TransmittanceStencilPixelShader =
-            TShaderMapRef<FGaussianSplatTransmittanceStencilPS>(ShaderMap);
     }
     if (!VertexShader.IsValid() || !PixelShader.IsValid()
         || !CompositeVertexShader.IsValid() || !CompositePixelShader.IsValid()
         || (bUsePrecomputedSplats && !PrecomputeShader.IsValid())
         || (bUsePrecomputedSplats && !ChunkIndirectArgsShader.IsValid())
-        || (bUseTransmittanceStencil
-            && (!ChunkIndirectArgsShader.IsValid()
-                || !TransmittanceStencilPixelShader.IsValid()))
         || (bUseStochasticSplat && !TemporalPixelShader.IsValid()))
     {
         return;
     }
     const int32 GeometryMode = GaussianSplatCVars::GetGeometryModeOnRenderThread();
     const bool bUseMeshShader = !bUsePrecomputedSplats
-        && !bUseTransmittanceStencil
         && GeometryMode == 1
         && GRHISupportsMeshShadersTier0
         && MeshShader.IsValid();
@@ -1199,8 +1053,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     FRDGBufferSRVRef ChunkPositionMaxSRV;
     FRDGBufferSRVRef ObjectIndexSRV;
     FRDGTextureRef GaussianAccumTexture = nullptr;
-    const bool bRenderToAccumTexture =
-        bCompositeToUELinear || bUseStochasticSplat || bUseTransmittanceStencil;
+    const bool bRenderToAccumTexture = bCompositeToUELinear || bUseStochasticSplat;
     FRDGBufferRef DrawIndirectArgsBuffer = nullptr;
     FRDGBufferSRVRef PrecomputedSplatSRV = nullptr;
     FRDGBufferUAVRef PrecomputedSplatUAV = nullptr;
@@ -1315,19 +1168,10 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
             FRDGTextureDesc GaussianAccumDesc = FRDGTextureDesc::Create2D(
                 SceneColorTexture->Desc.Extent,
                 PF_FloatRGBA,
-                FClearValueBinding(
-                    bUseTransmittanceStencil
-                        ? FLinearColor(0.0f, 0.0f, 0.0f, 1.0f)
-                        : FLinearColor::Transparent),
+                FClearValueBinding(FLinearColor::Transparent),
                 TexCreate_ShaderResource | TexCreate_RenderTargetable);
             GaussianAccumTexture = GraphBuilder.CreateTexture(GaussianAccumDesc, TEXT("GS_CurrentSampleColor"));
-            AddClearRenderTargetPass(
-                GraphBuilder,
-                GaussianAccumTexture,
-                bUseTransmittanceStencil
-                    ? FLinearColor(0.0f, 0.0f, 0.0f, 1.0f)
-                    : FLinearColor::Transparent,
-                ViewRect);
+            AddClearRenderTargetPass(GraphBuilder, GaussianAccumTexture, FLinearColor::Transparent, ViewRect);
         }
     }
 
@@ -1366,19 +1210,6 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
             FRDGBufferUAVDesc(PrecomputeChunkIndirectArgsBuffer, PF_R32_UINT));
     }
 
-    if (bUseTransmittanceStencil && !bUsePrecomputedSplats)
-    {
-        FRDGBufferDesc ChunkIndirectDesc =
-            FRDGBufferDesc::CreateIndirectDesc<FRHIDrawIndirectParameters>(2);
-        ChunkIndirectDesc.Usage |=
-            EBufferUsageFlags::UnorderedAccess | EBufferUsageFlags::ShaderResource;
-        PrecomputeChunkIndirectArgsBuffer = GraphBuilder.CreateBuffer(
-            ChunkIndirectDesc,
-            TEXT("GS_TransmittanceChunkDrawIndirectArgs"));
-        PrecomputeChunkIndirectArgsUAV = GraphBuilder.CreateUAV(
-            FRDGBufferUAVDesc(PrecomputeChunkIndirectArgsBuffer, PF_R32_UINT));
-    }
-
     FRDGTextureRef GaussianStochasticMotionTexture = nullptr;
     if (bUseStochasticReprojection)
     {
@@ -1400,33 +1231,11 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
             TexCreate_DepthStencilTargetable | TexCreate_ShaderResource);
         GaussianStochasticDepthTexture = GraphBuilder.CreateTexture(StochasticDepthDesc, TEXT("GS_StochasticDepth"));
     }
-    FRDGTextureRef GaussianTransmittanceStencilTexture = nullptr;
-    if (bUseTransmittanceStencil)
-    {
-        const FRDGTextureDesc StencilDesc = FRDGTextureDesc::Create2D(
-            SceneColorTexture->Desc.Extent,
-            PF_DepthStencil,
-            FClearValueBinding::DepthFar,
-            TexCreate_DepthStencilTargetable);
-        GaussianTransmittanceStencilTexture =
-            GraphBuilder.CreateTexture(
-                StencilDesc, TEXT("GS_TransmittanceStencil"));
-        // RDG requires stencil read access to use ELoad. Clear stencil in a
-        // dedicated write pass before the first splat pass, then load it for
-        // every early-stencil-tested draw.
-        AddClearStencilPass(
-            GraphBuilder, GaussianTransmittanceStencilTexture);
-    }
     if (!SortedIndexSRV || !VisibleCountSRV || !DrawIndirectArgsBuffer) return;
     if (bUsePrecomputedSplats
         && (!PrecomputedSplatSRV || !PrecomputedSplatUAV
+            || !PrecomputeChunkIndirectArgsBuffer || !PrecomputeChunkIndirectArgsUAV
             || PrecomputeChunkCapacity == 0u))
-    {
-        return;
-    }
-    if ((bUsePrecomputedSplats || bUseTransmittanceStencil)
-        && (!PrecomputeChunkIndirectArgsBuffer
-            || !PrecomputeChunkIndirectArgsUAV))
     {
         return;
     }
@@ -1435,9 +1244,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     const FViewInfo* ViewInfo = InView.bIsViewInfo ? &static_cast<const FViewInfo&>(InView) : nullptr;
     const FIntRect SceneDepthViewRect = ViewInfo ? ViewInfo->ViewRect : ViewRect;
     const bool bUseManualSceneDepthTest = SceneDepthTexture != nullptr
-        && (bUseStochasticSplat
-            || bUseTransmittanceStencil
-            || (ViewInfo && SceneDepthViewRect != ViewRect));
+        && (bUseStochasticSplat || (ViewInfo && SceneDepthViewRect != ViewRect));
 
     // 7. Build accumulation pass parameters and issue the merged splat draw call.
     FGaussianSplatPassParameters* PassParams = GraphBuilder.AllocParameters<FGaussianSplatPassParameters>();
@@ -1445,9 +1252,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         TRACE_CPUPROFILER_EVENT_SCOPE(GaussianSplat_SetupAccumulatePass_CPU);
         PassParams->RenderTargets[0] = FRenderTargetBinding(
             bRenderToAccumTexture ? GaussianAccumTexture : SceneColorTexture,
-            bRenderToAccumTexture
-                && !bUsePrecomputedSplats
-                && !bUseTransmittanceStencil
+            bRenderToAccumTexture && !bUsePrecomputedSplats
                 ? ERenderTargetLoadAction::EClear
                 : ERenderTargetLoadAction::ELoad);
         if (GaussianStochasticMotionTexture)
@@ -1455,15 +1260,7 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
             PassParams->RenderTargets[1] = FRenderTargetBinding(
                 GaussianStochasticMotionTexture, ERenderTargetLoadAction::EClear);
         }
-        if (bUseTransmittanceStencil)
-        {
-            PassParams->RenderTargets.DepthStencil = FDepthStencilBinding(
-                GaussianTransmittanceStencilTexture,
-                ERenderTargetLoadAction::ENoAction,
-                ERenderTargetLoadAction::ELoad,
-                FExclusiveDepthStencil::DepthNop_StencilRead);
-        }
-        else if (bUseStochasticSplat)
+        if (bUseStochasticSplat)
         {
             PassParams->RenderTargets.DepthStencil = FDepthStencilBinding(
                 GaussianStochasticDepthTexture,
@@ -1544,16 +1341,11 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     RasterPassContext.bUseManualSceneDepthTest = bUseManualSceneDepthTest;
     RasterPassContext.bUseMeshShader = bUseMeshShader;
     RasterPassContext.bUseStochasticSplat = bUseStochasticSplat;
-    RasterPassContext.bUseTransmittanceStencil =
-        bUseTransmittanceStencil;
     RasterPassContext.bHasSceneDepth = SceneDepthTexture != nullptr;
 
     FGaussianSplatPrecomputePassContext PrecomputePassContext;
     PrecomputePassContext.PrecomputeShader = PrecomputeShader;
     PrecomputePassContext.ChunkIndirectArgsShader = ChunkIndirectArgsShader;
-    PrecomputePassContext.FullscreenVertexShader = CompositeVertexShader;
-    PrecomputePassContext.TransmittanceStencilShader =
-        TransmittanceStencilPixelShader;
     PrecomputePassContext.BasePassParameters = PassParams;
     PrecomputePassContext.PackedPositionSRV = PackedPosSRV;
     PrecomputePassContext.PackedColorSRV = PackedColorSRV;
@@ -1576,9 +1368,6 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
         GaussianStochasticMotionTexture;
     PrecomputePassContext.StochasticDepthTexture =
         GaussianStochasticDepthTexture;
-    PrecomputePassContext.AccumTexture = GaussianAccumTexture;
-    PrecomputePassContext.TransmittanceStencilTexture =
-        GaussianTransmittanceStencilTexture;
     PrecomputePassContext.WorldToView = WorldToView;
     PrecomputePassContext.ViewToClip = ViewToClip;
     PrecomputePassContext.PreviousWorldToClip = PreviousWorldToClip;
@@ -1593,14 +1382,8 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
     PrecomputePassContext.EnableAntialiasing = bEnableAntialiasing;
     PrecomputePassContext.EnableOpacityAwareBounds =
         bEnableOpacityAwareBounds;
-    PrecomputePassContext.TransmittanceChunkCount =
-        TransmittanceChunkCount;
-    PrecomputePassContext.TransmittanceThreshold =
-        TransmittanceThreshold;
     PrecomputePassContext.bUsePrecomputedSplats = bUsePrecomputedSplats;
     PrecomputePassContext.bUseStochasticSplat = bUseStochasticSplat;
-    PrecomputePassContext.bUseTransmittanceStencil =
-        bUseTransmittanceStencil;
 
     if (bRenderToAccumTexture)
     {
@@ -1715,8 +1498,6 @@ void FGaussianSplatViewExtension::RenderGaussianSplats_RenderThread(
             CompositeParams->PS.GaussianAccumTexture = GaussianAccumTexture;
             CompositeParams->PS.PreExposure = CompositePreExposure;
             CompositeParams->PS.ConvertOutputToLinear = bCompositeToUELinear ? 1u : 0u;
-            CompositeParams->PS.TransmittanceAccumulation =
-                bUseTransmittanceStencil ? 1u : 0u;
             if (ViewInfo)
             {
                 CompositeParams->PS.View = ViewInfo->ViewUniformBuffer;

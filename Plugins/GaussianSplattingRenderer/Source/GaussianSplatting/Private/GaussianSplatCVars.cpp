@@ -158,27 +158,6 @@ static TAutoConsoleVariable<int32> CVarGaussianSplatPrecomputeChunkSplats(
     TEXT(" >0 = sorted chunk size, clamped to 65536..4194304 splats"),
     ECVF_RenderThreadSafe);
 
-static TAutoConsoleVariable<int32> CVarGaussianSplatTransmittanceStencil(
-    TEXT("r.GaussianSplat.TransmittanceStencil"),
-    0,
-    TEXT("Enable front-to-back transmittance accumulation and stencil early rejection.\n")
-    TEXT(" 0 = disabled (original back-to-front alpha blending)\n")
-    TEXT(" 1 = split sorted splats into chunks and reject saturated pixels before PS"),
-    ECVF_RenderThreadSafe);
-
-static TAutoConsoleVariable<int32> CVarGaussianSplatTransmittanceChunks(
-    TEXT("r.GaussianSplat.TransmittanceChunks"),
-    4,
-    TEXT("Number of front-to-back saturation-test groups used by stencil culling (1-16).\n")
-    TEXT("More chunks reject pixels earlier but add fullscreen stencil passes and barriers."),
-    ECVF_RenderThreadSafe);
-
-static TAutoConsoleVariable<float> CVarGaussianSplatTransmittanceThreshold(
-    TEXT("r.GaussianSplat.TransmittanceThreshold"),
-    0.01f,
-    TEXT("Remaining transmittance threshold used to mark a pixel saturated (0-1)."),
-    ECVF_RenderThreadSafe);
-
 
 namespace GaussianSplatCVars
 {
@@ -228,21 +207,6 @@ namespace GaussianSplatCVars
         return RequestedChunkSplats <= 0
             ? 0
             : FMath::Clamp(RequestedChunkSplats, 65536, 4194304);
-    }
-
-    int32 GetTransmittanceStencilOnAnyThread()
-    {
-        return CVarGaussianSplatTransmittanceStencil.GetValueOnAnyThread() != 0 ? 1 : 0;
-    }
-
-    int32 GetTransmittanceChunksOnRenderThread()
-    {
-        return FMath::Clamp(CVarGaussianSplatTransmittanceChunks.GetValueOnRenderThread(), 1, 16);
-    }
-
-    float GetTransmittanceThresholdOnRenderThread()
-    {
-        return FMath::Clamp(CVarGaussianSplatTransmittanceThreshold.GetValueOnRenderThread(), 0.0f, 1.0f);
     }
 
 

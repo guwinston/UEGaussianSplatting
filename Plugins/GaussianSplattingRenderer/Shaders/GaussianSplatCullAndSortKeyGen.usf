@@ -35,7 +35,6 @@ float MaxFocalLengthPixels;
 // 1: compact key/value stream for DeviceRadix
 // 2: compact values only for stochastic no-sort rendering
 uint CompactVisibleOutput;
-uint FrontToBackSort;
 uint DrawSplatOffset;
 uint DrawSplatCapacity;
 float4x4 WorldToView;
@@ -358,11 +357,7 @@ void BuildSortKeysCS(uint3 ThreadId : SV_DispatchThreadID)
             : globalSplatIndex;
         if (CompactVisibleOutput != 2u)
         {
-            // The legacy alpha-over path is back-to-front. Transmittance
-            // accumulation instead needs near-to-far order so destination alpha
-            // represents the remaining transmittance before this splat.
-            const float sortDepth = FrontToBackSort != 0u ? viewPos.z : -viewPos.z;
-            OutDepthKeys[outputIndex] = FloatToSortableUint(sortDepth);
+            OutDepthKeys[outputIndex] = FloatToSortableUint(-viewPos.z);
         }
 
         if (CompactVisibleOutput != 0u)

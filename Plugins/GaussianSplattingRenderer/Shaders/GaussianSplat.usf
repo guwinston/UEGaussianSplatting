@@ -645,7 +645,7 @@ FVSOutput GaussianSplatVS(uint VertexID : SV_VertexID)
 #else
 
     // ---- Decode sorted global splat index ----
-    uint globalIdx = SortedVisibleIndexBuffer[PrecomputeVisibleOffset + VertexID / 6];
+    uint globalIdx = SortedVisibleIndexBuffer[VertexID / 6];
     if (globalIdx >= (uint)TotalSplatCount)
     {
         return Out;
@@ -1117,22 +1117,12 @@ FCompositeVSOutput GaussianSplatCompositeVS(uint VertexID : SV_VertexID)
 
 Texture2D GaussianAccumTexture;
 uint ConvertOutputToLinear;
-uint TransmittanceAccumulation;
-float TransmittanceThreshold;
-
-void GaussianSplatTransmittanceStencilPS(FCompositeVSOutput In)
-{
-    const float transmittance = GaussianAccumTexture.Load(int3(int2(In.Position.xy), 0)).a;
-    clip(TransmittanceThreshold - transmittance);
-}
 
 float4 GaussianSplatCompositePS(FCompositeVSOutput In) : SV_Target0
 {
     int2 pixelCoord = int2(In.Position.xy);
     float4 accum = GaussianAccumTexture.Load(int3(pixelCoord, 0));
-    float alpha = TransmittanceAccumulation != 0u
-        ? saturate(1.0f - accum.a)
-        : saturate(accum.a);
+    float alpha = saturate(accum.a);
 
     if (alpha <= 1e-4f)
     {

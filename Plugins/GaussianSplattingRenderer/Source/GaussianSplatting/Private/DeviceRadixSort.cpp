@@ -4,7 +4,6 @@
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "RHI.h"
-#include "DataDrivenShaderPlatformInfo.h"
 
 IMPLEMENT_GLOBAL_SHADER(FDeviceRadixBuildIndirectArgsCS, "/Plugin/GaussianSplattingRenderer/Sort/DeviceRadixIndirectArgs.usf", "BuildIndirectArgs", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FDeviceRadixUpsweepCS, "/Plugin/GaussianSplattingRenderer/Sort/DeviceRadixSort.usf", "Upsweep", SF_Compute);
